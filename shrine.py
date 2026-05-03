@@ -1,5 +1,6 @@
 MAXIMUM_REDUCTION = 25
 TOTAL_POINTS = 330
+MAX_STAT_INVESTMENT = 100
 
 RACIAL_STATS = {
     "adret":     {"Charisma": 3, "Willpower": 2},
@@ -43,6 +44,17 @@ def shrine_of_order(stats: dict, race: str) -> tuple[dict, int]:
     if race not in RACIAL_STATS:
         raise ValueError(f"Unknown race: '{race}'")
 
+    # Validate stats
+    for stat, value in stats.items():
+        if stat not in ALL_STATS:
+            raise ValueError(f"Unknown stat: '{stat}'")
+        racial = get_racial_bonus(race, stat)
+        invested = value - racial
+        if invested < 0:
+            raise ValueError(f"{stat} cannot be below its racial bonus of {racial}")
+        if invested > MAX_STAT_INVESTMENT:
+            raise ValueError(f"{stat} exceeds the 100 point investment cap (you have {invested} invested)")
+
     # Work on a copy so we don't mutate the original
     stats = {k: v for k, v in stats.items()}
 
@@ -50,20 +62,26 @@ def shrine_of_order(stats: dict, race: str) -> tuple[dict, int]:
     preshrine = stats.copy()
 
     # Find stats the player has actually invested in (excluding pure racial stats)
+    # Track pure racial points separately so they aren't included in redistribution
     affected_stats = []
+    pure_racial_points = 0
     for stat, value in stats.items():
         if value <= 0:
             continue
         racial = get_racial_bonus(race, stat)
         if value - racial == 0:
+            pure_racial_points += value
             continue  # Only racial points here, not invested
         affected_stats.append(stat)
 
     if not affected_stats:
         return stats, 0
 
+    # Effective pool excludes pure racial points since shrine can't redistribute them
+    effective_pool = points_spent - pure_racial_points
+
     # Initial even split across all affected stats
-    base_value = points_spent / len(affected_stats)
+    base_value = effective_pool / len(affected_stats)
     for stat in affected_stats:
         stats[stat] = base_value
 
@@ -107,8 +125,8 @@ def shrine_of_order(stats: dict, race: str) -> tuple[dict, int]:
     points_after = count_points_spent(stats)
     spare = points_spent - points_after
 
-    # If spare exceeds the number of affected stats, give everyone +1
-    if spare > len(affected_stats):
+    # If spare >= number of affected stats, give everyone +1
+    if spare >= len(affected_stats):
         for stat in affected_stats:
             stats[stat] += 1
         spare -= len(affected_stats)
