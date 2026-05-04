@@ -1,6 +1,6 @@
 # 🏛️ Deepwoken Shrine Bot
 
-A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](https://www.roblox.com/games/4111023553/Deepwoken). Give it your pre-shrine build and it instantly calculates your post-shrine stats.
+A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](https://www.roblox.com/games/4111023553/Deepwoken). Give it your pre-shrine build and it instantly calculates your post-shrine stats. I plan on making it an automatic builder.
 
 ---
 
