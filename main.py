@@ -26,13 +26,14 @@ STAT_ALIASES = {
 }
 
 VALID_RACES = ", ".join(f"`{r}`" for r in RACIAL_STATS.keys())
+FUZZY_CUTOFF = 55
 
 
 def match_race(text):
     text = text.lower().strip()
     if text in RACIAL_STATS:
         return text
-    m = fuzz.extractOne(text, RACIAL_STATS.keys(), score_cutoff=55)
+    m = fuzz.extractOne(text, RACIAL_STATS.keys(), score_cutoff=FUZZY_CUTOFF)
     return m[0] if m else None
 
 
@@ -49,13 +50,19 @@ def parse_base_stats(s):
             stat = STAT_ALIASES[key]
             if stat not in base_order:
                 raise ValueError(f"`{key}` is not a base stat")
-            result[stat] = int(val)
+            v = int(val)
+            if v < 0:
+                raise ValueError(f"`{stat}` cannot be negative")
+            result[stat] = v
     else:
         values = s.split()
         if len(values) != 6:
             raise ValueError("Need exactly 6 numbers in order: `str fort agi int will cha`\nExample: `40 50 25 0 40 55`")
         for stat, val in zip(base_order, values):
-            result[stat] = int(val)
+            v = int(val)
+            if v < 0:
+                raise ValueError(f"`{stat}` cannot be negative")
+            result[stat] = v
     return result
 
 
@@ -73,7 +80,10 @@ def parse_kv_stats(s, allowed):
         stat = STAT_ALIASES[key]
         if stat not in allowed:
             raise ValueError(f"`{key}` doesn't belong here")
-        result[stat] = int(val)
+        v = int(val)
+        if v < 0:
+            raise ValueError(f"`{stat}` cannot be negative")
+        result[stat] = v
     return result
 
 
@@ -168,12 +178,13 @@ tree = app_commands.CommandTree(bot)
 
 
 async def wait_for_message(channel, user, timeout=120):
+    import asyncio
     def check(m):
         return m.author == user and m.channel == channel
     try:
         msg = await bot.wait_for("message", check=check, timeout=timeout)
         return msg.content.strip()
-    except Exception:
+    except asyncio.TimeoutError:
         return None
 
 
@@ -184,7 +195,6 @@ async def shrine_command(interaction: discord.Interaction):
     user = interaction.user
     race = None
 
-    # Step 1: Race
     await interaction.response.send_message(embed=races_embed())
     while True:
         race_input = await wait_for_message(channel, user)
@@ -198,14 +208,12 @@ async def shrine_command(interaction: discord.Interaction):
         await channel.send(race_confirmed_msg(race))
         break
 
-    # Step 2: Base stats
     while True:
         base_input = await wait_for_message(channel, user)
         if not base_input:
             await channel.send("❌ Timed out. Run `/shrine` again.")
             return
-        # Let user switch race by typing a single word
-        if len(base_input.split()) == 1:
+        if len(base_input.split()) == 1 and not base_input.strip().lstrip('-').isdigit():
             switched = match_race(base_input)
             if switched:
                 race = switched
@@ -228,7 +236,6 @@ async def shrine_command(interaction: discord.Interaction):
         await channel.send(f"Base stats set — **{spent}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - spent}** left")
         break
 
-    # Step 3: Attunements
     while True:
         skip_view = SkipView()
         await channel.send(
@@ -264,7 +271,6 @@ async def shrine_command(interaction: discord.Interaction):
         await channel.send(f"Attunements set — **{spent}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - spent}** left")
         break
 
-    # Step 4: Weapon
     while True:
         skip_view2 = SkipView()
         await channel.send(
@@ -300,7 +306,6 @@ async def shrine_command(interaction: discord.Interaction):
         await channel.send(f"Weapon set — **{spent}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - spent}** left")
         break
 
-    # Result
     invested = count_points_spent({k: v for k, v in build.items() if v > 0})
     points_before = TOTAL_POINTS - invested
     before = build.copy()
