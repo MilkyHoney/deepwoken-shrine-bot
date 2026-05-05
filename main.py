@@ -87,7 +87,12 @@ def parse_kv_stats(s, allowed):
     return result
 
 
-def check_caps(build, race):
+def check_caps(build, race, step="base"):
+    retry_hints = {
+        "base": "Try again: `str  fort  agi  int  will  cha`",
+        "attunement": "Try again: `flame=80 thunder=35 frost=40`",
+        "weapon": "Try again: `med=85` or `light=60` or `heavy=70`",
+    }
     for stat, value in build.items():
         if value <= 0:
             continue
@@ -96,7 +101,7 @@ def check_caps(build, race):
             invested = value - racial
             msg = f"❌ **{stat}** has {invested} points invested, exceeding the 100 point cap"
             msg += f" (you entered {value}, racial bonus is +{racial})" if racial else f" (you entered {value})"
-            msg += "\nTry again: `str  fort  agi  int  will  cha`"
+            msg += f"\n{retry_hints.get(step, '')}"
             return msg
     return None
 
@@ -167,8 +172,8 @@ class SkipView(discord.ui.View):
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.skipped = True
-        self.stop()
         await interaction.response.defer()
+        self.stop()
 
 
 intents = discord.Intents.default()
@@ -225,15 +230,17 @@ async def shrine_command(interaction: discord.Interaction):
         except ValueError as e:
             await channel.send(f"❌ {e}\nTry again:")
             continue
-        err = check_caps(build, race)
+        err = check_caps(build, race, step="base")
         if err:
             await channel.send(err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        if spent > TOTAL_POINTS:
-            await channel.send(f"❌ That's **{spent}** points, exceeding the {TOTAL_POINTS} budget. Try again:")
+        racial_total = sum(get_racial_bonus(race, s) for s in build)
+        invested = spent - racial_total
+        if invested > TOTAL_POINTS:
+            await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
-        await channel.send(f"Base stats set — **{spent}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - spent}** left")
+        await channel.send(f"Base stats set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
         break
 
     while True:
@@ -260,15 +267,17 @@ async def shrine_command(interaction: discord.Interaction):
         except ValueError as e:
             await channel.send(f"❌ {e}\nTry again:")
             continue
-        err = check_caps(build, race)
+        err = check_caps(build, race, step="attunement")
         if err:
             await channel.send(err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        if spent > TOTAL_POINTS:
-            await channel.send(f"❌ That's **{spent}** points, exceeding the {TOTAL_POINTS} budget. Try again:")
+        racial_total = sum(get_racial_bonus(race, s) for s in build)
+        invested = spent - racial_total
+        if invested > TOTAL_POINTS:
+            await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
-        await channel.send(f"Attunements set — **{spent}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - spent}** left")
+        await channel.send(f"Attunements set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
         break
 
     while True:
@@ -295,19 +304,22 @@ async def shrine_command(interaction: discord.Interaction):
         except ValueError as e:
             await channel.send(f"❌ {e}\nTry again:")
             continue
-        err = check_caps(build, race)
+        err = check_caps(build, race, step="weapon")
         if err:
             await channel.send(err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        if spent > TOTAL_POINTS:
-            await channel.send(f"❌ That's **{spent}** points, exceeding the {TOTAL_POINTS} budget. Try again:")
+        racial_total = sum(get_racial_bonus(race, s) for s in build)
+        invested = spent - racial_total
+        if invested > TOTAL_POINTS:
+            await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
-        await channel.send(f"Weapon set — **{spent}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - spent}** left")
+        await channel.send(f"Weapon set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
         break
 
     invested = count_points_spent({k: v for k, v in build.items() if v > 0})
-    points_before = TOTAL_POINTS - invested
+    racial_total = sum(get_racial_bonus(race, s) for s in build)
+    points_before = TOTAL_POINTS - (invested - racial_total)
     before = build.copy()
     try:
         after, spare = shrine_of_order(build, race)
