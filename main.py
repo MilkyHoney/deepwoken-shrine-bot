@@ -235,7 +235,7 @@ async def shrine_command(interaction: discord.Interaction):
             await channel.send(err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        racial_total = sum(get_racial_bonus(race, s) for s in build)
+        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
             await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
@@ -272,7 +272,7 @@ async def shrine_command(interaction: discord.Interaction):
             await channel.send(err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        racial_total = sum(get_racial_bonus(race, s) for s in build)
+        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
             await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
@@ -309,7 +309,7 @@ async def shrine_command(interaction: discord.Interaction):
             await channel.send(err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        racial_total = sum(get_racial_bonus(race, s) for s in build)
+        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
             await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
@@ -318,7 +318,7 @@ async def shrine_command(interaction: discord.Interaction):
         break
 
     invested = count_points_spent({k: v for k, v in build.items() if v > 0})
-    racial_total = sum(get_racial_bonus(race, s) for s in build)
+    racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
     points_before = TOTAL_POINTS - (invested - racial_total)
     before = build.copy()
     try:
@@ -349,10 +349,15 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+_synced = False
+
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"✅ Logged in as {bot.user} — slash commands synced.")
+    global _synced
+    if not _synced:
+        await tree.sync()
+        _synced = True
+    print(f"✅ Logged in as {bot.user}")
 
 
 keep_alive()
