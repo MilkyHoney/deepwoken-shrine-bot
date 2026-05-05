@@ -1,6 +1,6 @@
 # Deepwoken Shrine Bot
 
-A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](https://www.roblox.com/games/4111023553/Deepwoken). Run `/shrine` and walk through a guided flow to see exactly how your build gets redistributed.
+A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](https://www.roblox.com/games/4111023553/Deepwoken). Run `/shrine` and walk through a guided flow to see exactly how your build gets redistributed. I plan on adding an automated builder.
 
 ---
 
