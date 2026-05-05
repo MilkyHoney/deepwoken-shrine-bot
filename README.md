@@ -1,21 +1,29 @@
-# 🏛️ Deepwoken Shrine Bot
+# Deepwoken Shrine Bot
 
-A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](https://www.roblox.com/games/4111023553/Deepwoken). Give it your pre-shrine build and it instantly calculates your post-shrine stats. I plan on making it an automatic builder.
+A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](https://www.roblox.com/games/4111023553/Deepwoken). Run `/shrine` and walk through a guided flow to see exactly how your build gets redistributed.
 
 ---
 
 ## Commands
 
 | Command | Description |
-|--------|-------------|
-| `?shrine <race> <stats> [points_left=N]` | Simulate Shrine of Order on your build |
-| `?races` | List all races and their stat bonuses |
-| `?help` | Show usage instructions |
+|---------|-------------|
+| `/shrine` | Start the interactive Shrine of Order simulator |
+| `/races` | List all races and their stat bonuses |
+| `/help` | Show usage instructions and stat shortcuts |
 
-### Example
-```
-?shrine khan str=40 fort=50 agi=25 will=40 cha=55 light=1 flame=100
-```
+---
+
+## How `/shrine` Works
+
+The bot walks you through the build step-by-step:
+
+1. **Pick your race** — type the name or let fuzzy matching catch your typo
+2. **Enter base stats** — `40 50 25 0 40 55` or `str=40 fort=50 agi=25 int=0 will=40 cha=55`
+3. **Enter attunements** (or skip) — `flame=80 thunder=35 frost=40`
+4. **Enter weapon** (or skip) — `med=85` or `light=60` or `heavy=70`
+
+The bot validates caps and budget at every step, then outputs a clean embed showing your pre-shrine → post-shrine stat changes.
 
 ---
 
@@ -67,4 +75,18 @@ A Discord bot that simulates the **Shrine of Order** mechanic from [Deepwoken](h
 
 ## How Shrine of Order Works
 
-Shrine of Order evenly redistributes all your invested stat points across every stat you've put points into. Non-attunement stats cannot be reduced by more than **25 points**. Attunements (Flamecharm, Frostdraw, etc.) are exempt from this cap and can be reduced freely.
+Shrine of Order **evenly redistributes** all your invested stat points across every stat you've put points into.
+
+- **Base stats** cannot drop by more than **25 points** from their pre-shrine value.
+- **Attunements** (Flamecharm, Frostdraw, Thundercall, Galebreathe, Shadowcast, Ironsing, Bloodrend) are **exempt** from the −25 reduction cap and can be reduced freely.
+- **Weapon stats** follow the same −25 cap as base stats.
+
+The bot handles the math, racial bonuses, and 330-point budget cap automatically.
+
+---
+
+## Tech
+
+- `discord.py` with app commands (slash commands)
+- `rapidfuzz` for typo-tolerant race matching
+- Hosted on Replit with `keep_alive` ping monitor
