@@ -1,364 +1,277 @@
-"""
-Talent cache module for Deepwoken Discord bot.
-Reads from local talents_dump.txt (fallback if wiki scrape fails).
-Refreshes every 6 hours via the talent_refresh_loop in main.py.
-"""
-
-import re
-import time
+import json
 import os
-import requests
-from bs4 import BeautifulSoup
+import re
+
+import discord
 from rapidfuzz import process as fuzz
 
-WIKI_URL = "https://deepwoken.fandom.com/wiki/Talents"
-DUMP_FILE = "talents_dump.txt"
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "talents.json")
+
+_cache = {"talents": []}
+
+# ---------------------------------------------------------------------------
+# Rarity colors for embeds
+# ---------------------------------------------------------------------------
 
 RARITY_COLORS = {
-    "Common": 0x95a5a6,
-    "Rare": 0x3498db,
-    "Advanced": 0x9b59b6,
-    "Oath": 0xe74c3c,
-    "Memento": 0xe74c3c,
-    "Race": 0x2ecc71,
-    "Mantra Level": 0xf1c40f,
-    "Mastery": 0xf1c40f,
-    "Origin": 0x1abc9c,
-    "Quest": 0xe67e22,
-    "Faction": 0xd35400,
-    "Mantra": 0x34495e,
-    "Mystery": 0x7f8c8d,
-    "Equipment": 0xbdc3c7,
-    "Outfit": 0xbdc3c7,
-    "Unlockable": 0x8e44ad,
-    "Dual Attunement": 0x16a085,
-    "Triple Attunement": 0x27ae60,
-    "Echo": 0xc0392b,
+    "Common":    0x95a5a6,
+    "Rare":      0x3498db,
+    "Advanced":  0x9b59b6,
+    "Oath":      0xe74c3c,
+    "Innate":    0x2ecc71,
+    "Quest":     0xf39c12,
+    "Murmur":    0x1abc9c,
+    "Spec":      0x1abc9c,
+    "Faction":   0xe67e22,
+    "Origin":    0x34495e,
+    "Equipment": 0x7f8c8d,
+    "Outfit":    0x7f8c8d,
+    "Memento":   0x8e44ad,
+    "Weapon":    0xf1c40f,
 }
+
+# ---------------------------------------------------------------------------
+# Stat aliases — for parsing user input
+# ---------------------------------------------------------------------------
 
 STAT_ALIASES = {
-    "strength": "Strength", "str": "Strength",
-    "fortitude": "Fortitude", "fort": "Fortitude",
-    "agility": "Agility", "agi": "Agility",
-    "intelligence": "Intelligence", "int": "Intelligence",
-    "willpower": "Willpower", "will": "Willpower",
-    "charisma": "Charisma", "cha": "Charisma",
-    "flamecharm": "Flamecharm", "flame": "Flamecharm",
-    "frostdraw": "Frostdraw", "frost": "Frostdraw",
-    "thundercall": "Thundercall", "thunder": "Thundercall",
-    "galebreathe": "Galebreathe", "gale": "Galebreathe",
-    "shadowcast": "Shadowcast", "shadow": "Shadowcast",
-    "ironsing": "Ironsing", "iron": "Ironsing",
-    "bloodrend": "Bloodrend", "blood": "Bloodrend",
-    "lightweapon": "LightWeapon", "light": "LightWeapon", "lht": "LightWeapon",
-    "mediumweapon": "MediumWeapon", "medium": "MediumWeapon", "med": "MediumWeapon",
-    "heavyweapon": "HeavyWeapon", "heavy": "HeavyWeapon", "hvy": "HeavyWeapon",
-    "mind": "Mind",
-    "weapon": "Weapon",
-    "power": "Power",
-    "element": "Element",
+    "str": "Strength", "strength": "Strength",
+    "fort": "Fortitude", "fortitude": "Fortitude",
+    "agi": "Agility", "agility": "Agility",
+    "int": "Intelligence", "intelligence": "Intelligence",
+    "will": "Willpower", "willpower": "Willpower",
+    "cha": "Charisma", "charisma": "Charisma",
+    "flame": "Flamecharm", "flamecharm": "Flamecharm",
+    "frost": "Frostdraw", "frostdraw": "Frostdraw",
+    "thunder": "Thundercall", "thundercall": "Thundercall",
+    "gale": "Galebreathe", "galebreathe": "Galebreathe",
+    "shadow": "Shadowcast", "shadowcast": "Shadowcast",
+    "iron": "Ironsing", "ironsing": "Ironsing",
+    "blood": "Bloodrend", "bloodrend": "Bloodrend",
+    "light": "Light Weapon", "lightweapon": "Light Weapon", "lht": "Light Weapon",
+    "med": "Medium Weapon", "medium": "Medium Weapon", "mediumweapon": "Medium Weapon",
+    "heavy": "Heavy Weapon", "heavyweapon": "Heavy Weapon", "hvy": "Heavy Weapon",
 }
 
-_VALID_STATS = list(dict.fromkeys(STAT_ALIASES.values()))
-
-_talents = []
-_talents_by_name = {}
-_last_refresh = None
+CANONICAL_STATS = sorted(set(STAT_ALIASES.values()))
 
 
-def _norm_stat(name):
-    return STAT_ALIASES.get(name.lower().strip(), name.title())
-
-
-def _is_garbage_line(line):
-    garbage = [
-        "http://", "https://", "fandom.com", "Fandom Apps", "Store icon",
-        "View Mobile Site", "Fandom Games Community", "Take your favorite",
-        "never miss a beat", "App logo", "mediakit", "apple.com", "play.google.com",
-        "[edit]", "[show]", "[hide]", "Categories:", "Community content",
-        "Follow on IG", "Follow on TikTok", "Follow on Twitter", "Subscribe on YT",
-        "Fan Feed", "More Fandoms", "Explore properties", "Advertise", "Media Kit",
-        "Contact", "Terms of Use", "Privacy Policy", "Do Not Sell", "Cookie Policy",
-    ]
-    low = line.lower()
-    return any(g.lower() in low for g in garbage) or (line.startswith("[") and line.endswith("]") and line[1:-1].isdigit())
-
-
-def _extract_rarity(tag_text):
-    m = re.search(r"\[([^,\]]+)\s+Talent", tag_text)
-    if m:
-        return m.group(1).strip()
-    for keyword in ["Oath Talent", "Origin Talent", "Quest Talent", "Faction Talent",
-                    "Mastery Talent", "Mantra Level Talent", "Race Talent",
-                    "Equipment Talent", "Echo Talent", "Unlockable Talent"]:
-        if keyword in tag_text:
-            return keyword.replace(" Talent", "").strip()
-    return "Common"
-
-
-def _extract_stats_from_line(line):
-    stats = []
-    for m in re.finditer(r"\b(\d+)\s+([A-Za-z]+)\b", line):
-        num, word = m.groups()
-        word = word.lower().strip()
-        if word in STAT_ALIASES:
-            stats.append(f"{num} {STAT_ALIASES[word]}")
-        elif word in ("med", "medium"):
-            stats.append(f"{num} MediumWeapon")
-        elif word in ("lht", "light"):
-            stats.append(f"{num} LightWeapon")
-        elif word in ("hvy", "heavy"):
-            stats.append(f"{num} HeavyWeapon")
-        elif word == "str":
-            stats.append(f"{num} Strength")
-        elif word == "fort":
-            stats.append(f"{num} Fortitude")
-        elif word == "agi":
-            stats.append(f"{num} Agility")
-        elif word == "int":
-            stats.append(f"{num} Intelligence")
-        elif word == "will":
-            stats.append(f"{num} Willpower")
-        elif word == "cha":
-            stats.append(f"{num} Charisma")
-        elif word == "flame":
-            stats.append(f"{num} Flamecharm")
-        elif word == "frost":
-            stats.append(f"{num} Frostdraw")
-        elif word == "thunder":
-            stats.append(f"{num} Thundercall")
-        elif word == "gale":
-            stats.append(f"{num} Galebreathe")
-        elif word == "shadow":
-            stats.append(f"{num} Shadowcast")
-        elif word == "iron":
-            stats.append(f"{num} Ironsing")
-        elif word == "blood":
-            stats.append(f"{num} Bloodrend")
-
-    for m in re.finditer(r"\b(\d+)\s+([A-Za-z]+\s+[A-Za-z]+)\b", line):
-        num, phrase = m.groups()
-        phrase_clean = phrase.lower().strip().replace(" ", "")
-        if phrase_clean in STAT_ALIASES:
-            stats.append(f"{num} {STAT_ALIASES[phrase_clean]}")
-        elif phrase_clean in ("lightweapon", "light weapon"):
-            stats.append(f"{num} LightWeapon")
-        elif phrase_clean in ("mediumweapon", "medium weapon"):
-            stats.append(f"{num} MediumWeapon")
-        elif phrase_clean in ("heavyweapon", "heavy weapon"):
-            stats.append(f"{num} HeavyWeapon")
-
-    seen = set()
-    deduped = []
-    for s in stats:
-        if s.lower() not in seen:
-            seen.add(s.lower())
-            deduped.append(s)
-    return deduped
-
-
-def _parse_talent_block(lines):
-    if not lines:
+def normalize_stat(s: str):
+    """Convert any user input ('agi', 'AGILITY', 'agility ') to canonical 'Agility'."""
+    if not s:
         return None
-    first = lines[0]
-    first = re.sub(r"^\s*•\s*", "", first)
-    name_match = re.match(r"^\s*(.+?)\s*\[", first)
-    if not name_match:
-        return None
-    name = name_match.group(1).strip()
-    rarity = _extract_rarity(first)
-
-    description = []
-    prerequisites = []
-    notes = []
-    category = "General"
-
-    for line in lines[1:]:
-        line = line.strip()
-        if not line:
-            continue
-        if _is_garbage_line(line):
-            continue
-        if line.startswith("Prerequisite"):
-            prerequisites.append(line)
-        elif line.startswith("Prerequisites"):
-            prerequisites.append(line)
-        elif "Mutual Exclusive" in line:
-            prerequisites.append(line)
-        elif line.startswith("Obtained from"):
-            prerequisites.append(line)
-        else:
-            description.append(line)
-
-    # Extract stats from ALL lines (header + body)
-    stats = []
-    for line in lines:
-        stats.extend(_extract_stats_from_line(line))
-    seen = set()
-    deduped = []
-    for s in stats:
-        if s.lower() not in seen:
-            seen.add(s.lower())
-            deduped.append(s)
-    stats = deduped
-
-    if any(o in first for o in ["Oath Talent", "Oath:"]):
-        category = "Oath"
-    elif "Quest Talent" in first:
-        category = "Quest"
-    elif "Faction Talent" in first:
-        category = "Faction"
-    elif "Race Talent" in first:
-        category = "Race"
-    elif "Mastery Talent" in first:
-        category = "Mastery"
-    elif "Mantra Level Talent" in first:
-        category = "Mantra Level"
-    elif "Origin Talent" in first:
-        category = "Origin"
-    elif any(w in first for w in ["Flamecharm", "Frostdraw", "Thundercall", "Galebreathe", "Shadowcast", "Ironsing", "Bloodrend"]):
-        category = "Attunement"
-    elif any(w in first for w in ["Light Weapon", "Medium Weapon", "Heavy Weapon", "Weapon"]):
-        category = "Weapon"
-    elif any(w in first for w in ["Strength", "Fortitude", "Agility", "Intelligence", "Willpower", "Charisma"]):
-        category = "Attribute"
-
-    return {
-        "name": name,
-        "rarity": rarity,
-        "category": category,
-        "stats": stats,
-        "description": " ".join(description).replace("**", "").replace("*", "")[:500],
-        "prerequisites": prerequisites,
-        "notes": notes,
-    }
+    key = s.lower().replace(" ", "")
+    if key in STAT_ALIASES:
+        return STAT_ALIASES[key]
+    # Fuzzy fallback for typos like "agilit"
+    m = fuzz.extractOne(s, CANONICAL_STATS, score_cutoff=60)
+    return m[0] if m else None
 
 
-def _parse_text_dump(text):
-    parsed = []
-    current_block = []
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
 
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or _is_garbage_line(line):
-            continue
+def load_talents():
+    if _cache["talents"]:
+        return _cache["talents"]
+    try:
+        with open(DATA_PATH, encoding="utf-8") as f:
+            _cache["talents"] = json.load(f)
+        print(f"[Talents] Loaded {len(_cache['talents'])} talents from {DATA_PATH}")
+    except FileNotFoundError:
+        print(f"[Talents] ERROR: {DATA_PATH} not found. Place talents.json next to talents.py.")
+        _cache["talents"] = []
+    except Exception as e:
+        print(f"[Talents] ERROR loading {DATA_PATH}: {e}")
+        _cache["talents"] = []
+    return _cache["talents"]
 
-        if re.search(r"\[.*Talent.*\]", line) and not re.match(r"^\[\d+\]$", line):
-            if current_block:
-                t = _parse_talent_block(current_block)
-                if t:
-                    parsed.append(t)
-            current_block = [line]
-        elif current_block:
-            current_block.append(line)
 
-    if current_block:
-        t = _parse_talent_block(current_block)
-        if t:
-            parsed.append(t)
-    return parsed
+def get_talents():
+    return load_talents()
 
 
 def refresh_cache():
-    global _talents, _talents_by_name, _last_refresh
-
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
-        }
-        resp = requests.get(WIKI_URL, timeout=30, headers=headers)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        content = soup.get_text(separator="\n")
-        parsed = _parse_text_dump(content)
-        source = "wiki"
-    except Exception as e:
-        print(f"[talents] Wiki scrape failed: {e}")
-        parsed = []
-        source = None
-
-    if not parsed and os.path.exists(DUMP_FILE):
-        try:
-            with open(DUMP_FILE, "r", encoding="utf-8") as f:
-                parsed = _parse_text_dump(f.read())
-            source = "local file"
-        except Exception as e:
-            print(f"[talents] Local file read failed: {e}")
-
-    _talents = parsed
-    _talents_by_name = {t["name"].lower(): t for t in parsed}
-    _last_refresh = time.time()
-
-    if parsed:
-        print(f"[talents] Cache refreshed: {len(parsed)} talents loaded from {source}.")
-    else:
-        print("[talents] Warning: no talents loaded. /talents will return empty results.")
+    """Reload from disk. Called by main.py's background loop."""
+    _cache["talents"] = []
+    load_talents()
 
 
-def parse_stat_query(query: str):
-    m = re.match(r"^(\d+)\s+([A-Za-z\s]+)$", query.strip())
-    if not m:
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+def search_by_name(query: str):
+    """Fuzzy match a talent by name. Returns the talent dict or None."""
+    talents = get_talents()
+    if not talents:
         return None
-    level, stat_raw = m.groups()
-    stat_raw = stat_raw.strip()
-
-    norm = _norm_stat(stat_raw)
-    if norm in _VALID_STATS:
-        return int(level), norm
-
-    match = fuzz.extractOne(stat_raw.lower(), [s.lower() for s in _VALID_STATS], score_cutoff=70)
-    if match:
-        for s in _VALID_STATS:
-            if s.lower() == match[0]:
-                return int(level), s
-
-    return None
+    names = [t["name"] for t in talents]
+    match = fuzz.extractOne(query, names, score_cutoff=50)
+    if not match:
+        return None
+    return next((t for t in talents if t["name"] == match[0]), None)
 
 
-def search_by_stat(stat_name: str, level: int):
-    """
-    Return talents that require the given stat at EXACTLY the given level.
-    Talents may have other stat requirements too — they are still shown.
-    """
-    stat_name = _norm_stat(stat_name)
+def search_by_stat(stat: str, level: int):
+    """Find all talents requiring exactly `level` of `stat` (after fuzzy stat normalization)."""
+    canonical = normalize_stat(stat)
+    if not canonical:
+        return []
+
     results = []
-    for t in _talents:
-        for req in t.get("stats", []):
-            parts = req.split()
-            if len(parts) >= 2:
-                try:
-                    req_level = int(parts[0])
-                    req_stat = " ".join(parts[1:])
-                    if req_stat.lower() == stat_name.lower() and req_level == level:
-                        results.append(t)
-                        break
-                except ValueError:
-                    continue
+    for t in get_talents():
+        reqs = t.get("requirements") or {}
+        stats = reqs.get("stats") or {}
+        if not isinstance(stats, dict):
+            continue
+        if stats.get(canonical) == level:
+            results.append(t)
     return results
 
 
-def search_by_name(query: str):
-    query = query.lower().strip()
-    if query in _talents_by_name:
-        return _talents_by_name[query]
-    names = list(_talents_by_name.keys())
-    if not names:
-        return None
-    match = fuzz.extractOne(query, names, score_cutoff=60)
-    if match:
-        return _talents_by_name[match[0]]
+def parse_stat_query(query: str):
+    """Parse '40 Agility' or 'Agility 40' into (level, stat_name). None if not a stat query."""
+    query = query.strip()
+    m = re.match(r"^(\d+)\s+(.+)$", query)
+    if m:
+        return int(m.group(1)), m.group(2)
+    m = re.match(r"^(.+?)\s+(\d+)$", query)
+    if m:
+        return int(m.group(2)), m.group(1)
     return None
 
 
-refresh_cache()
+# ---------------------------------------------------------------------------
+# Embed formatting
+# ---------------------------------------------------------------------------
+
+def _format_requirements(reqs: dict) -> str:
+    """Turn the requirements dict into a readable bullet list."""
+    if not isinstance(reqs, dict) or not reqs:
+        return ""
+    lines = []
+
+    stats = reqs.get("stats") or {}
+    if isinstance(stats, dict) and stats:
+        lines.append("**Stats:** " + ", ".join(f"{v} {k}" for k, v in stats.items()))
+
+    if reqs.get("talents"):
+        lines.append("**Talents:** " + ", ".join(reqs["talents"]))
+    if reqs.get("mantras"):
+        lines.append("**Mantras:** " + ", ".join(reqs["mantras"]))
+    if reqs.get("weapon"):
+        w = reqs["weapon"]
+        lines.append("**Weapon:** " + (", ".join(w) if isinstance(w, list) else str(w)))
+    if reqs.get("weaponType"):
+        wt = reqs["weaponType"]
+        lines.append("**Weapon Type:** " + (", ".join(wt) if isinstance(wt, list) else str(wt)))
+    if reqs.get("equipment"):
+        eq = reqs["equipment"]
+        lines.append("**Equipment:** " + (", ".join(eq) if isinstance(eq, list) else str(eq)))
+    if reqs.get("outfit"):
+        o = reqs["outfit"]
+        lines.append("**Outfit:** " + (", ".join(o) if isinstance(o, list) else str(o)))
+    if reqs.get("set"):
+        lines.append(f"**Set:** {reqs['set']}")
+    if reqs.get("aspect"):
+        a = reqs["aspect"]
+        lines.append("**Aspect:** " + (", ".join(a) if isinstance(a, list) else str(a)))
+    if reqs.get("origin"):
+        lines.append(f"**Origin:** {reqs['origin']}")
+    if reqs.get("memento"):
+        lines.append(f"**Memento:** {reqs['memento']}")
+    if reqs.get("murmur"):
+        lines.append(f"**Murmur:** {reqs['murmur']}")
+    if reqs.get("quests"):
+        q = reqs["quests"]
+        lines.append("**Quest:** " + (", ".join(q) if isinstance(q, list) else str(q)))
+    if reqs.get("objectives"):
+        obj = reqs["objectives"]
+        lines.append("**Objectives:** " + (", ".join(obj) if isinstance(obj, list) else str(obj)))
+    if reqs.get("slay"):
+        s = reqs["slay"]
+        lines.append("**Slay:** " + (", ".join(s) if isinstance(s, list) else str(s)))
+    if reqs.get("or"):
+        lines.append(f"**Or:** {reqs['or']}")
+    if reqs.get("add"):
+        lines.append(f"**Additional:** {reqs['add']}")
+
+    return "\n".join(lines)
+
+
+def _format_stat_bonuses(stats) -> str:
+    """Format the bonus stats a talent grants (e.g. {Sanity: 20})."""
+    if not isinstance(stats, dict) or not stats:
+        return ""
+    return ", ".join(f"+{v} {k}" for k, v in stats.items())
+
+
+def build_talent_embed(talent: dict) -> discord.Embed:
+    """Render a single talent into a Discord embed."""
+    color = RARITY_COLORS.get(talent.get("rarity", ""), 0x95a5a6)
+    title = talent["name"]
+    if talent.get("VOI"):
+        title += " 🛡️"  # Vow of Iron marker
+    if talent.get("vaulted"):
+        title += " (Vaulted)"
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Category", value=talent.get("category") or "General", inline=True)
+    embed.add_field(name="Rarity", value=talent.get("rarity") or "—", inline=True)
+
+    bonuses = _format_stat_bonuses(talent.get("stats"))
+    if bonuses:
+        embed.add_field(name="Bonuses", value=bonuses, inline=True)
+
+    desc = (talent.get("description") or "").strip()
+    if desc:
+        embed.add_field(name="Description", value=desc[:1024], inline=False)
+
+    reqs_text = _format_requirements(talent.get("requirements"))
+    if reqs_text:
+        embed.add_field(name="Requirements", value=reqs_text[:1024], inline=False)
+
+    me = talent.get("mutualExclusives") or []
+    if me:
+        embed.add_field(name="Mutually Exclusive", value=", ".join(me)[:1024], inline=False)
+
+    info = (talent.get("additionalInfo") or "").strip()
+    if info:
+        embed.add_field(name="Notes", value=info[:1024], inline=False)
+
+    footer = "Deepwoken Talent"
+    if talent.get("VOI"):
+        footer += " · Vow of Iron exclusive"
+    embed.set_footer(text=footer)
+
+    return embed
+
+
+def build_stat_results_embed(stat: str, level: int, results: list) -> discord.Embed:
+    """Render a list of talents matching a stat search."""
+    canonical = normalize_stat(stat) or stat
+    embed = discord.Embed(
+        title=f"Talents requiring exactly {level} {canonical}",
+        color=0x2ecc71,
+    )
+    if not results:
+        embed.description = f"No talents found requiring **{level} {canonical}**."
+        return embed
+
+    lines = []
+    for t in results[:20]:
+        rarity = (t.get("rarity") or "").replace(" Talent", "")
+        category = t.get("category") or ""
+        desc = (t.get("description") or "").strip()
+        snippet = desc[:80] + ("…" if len(desc) > 80 else "")
+        voi = " 🛡️" if t.get("VOI") else ""
+        lines.append(f"**{t['name']}**{voi} _({rarity} · {category})_ — {snippet}")
+
+    embed.description = "\n\n".join(lines)
+    if len(results) > 20:
+        embed.set_footer(text=f"Showing 20 of {len(results)} results")
+    else:
+        embed.set_footer(text=f"{len(results)} talent(s) found")
+    return embed
