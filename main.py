@@ -1,9 +1,14 @@
 import discord
 from discord import app_commands
 import os
+import asyncio
 from rapidfuzz import process as fuzz
 
-from shrine import shrine_of_order, count_points_spent, TOTAL_POINTS, RACIAL_STATS, ALL_STATS, ATTUNEMENTS, get_racial_bonus, MAX_STAT_INVESTMENT
+from shrine import (
+    shrine_of_order, count_points_spent, TOTAL_POINTS, RACIAL_STATS,
+    ALL_STATS, ATTUNEMENTS, get_racial_bonus, MAX_STAT_INVESTMENT,
+)
+import talents as talent_cache
 from keep_alive import keep_alive
 
 STAT_ALIASES = {
@@ -183,7 +188,6 @@ tree = app_commands.CommandTree(bot)
 
 
 async def wait_for_message(channel, user, timeout=120):
-    import asyncio
     def check(m):
         return m.author == user and m.channel == channel
     try:
@@ -193,9 +197,20 @@ async def wait_for_message(channel, user, timeout=120):
         return None
 
 
+async def talent_refresh_loop():
+    """Reload talents.json from disk every 6 hours so file edits show up without a restart."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        talent_cache.refresh_cache()
+        await asyncio.sleep(6 * 3600)
+
+
+# ---------------------------------------------------------------------------
+# /shrine
+# ---------------------------------------------------------------------------
+
 @tree.command(name="shrine", description="Simulate Shrine of Order on your Deepwoken build")
 async def shrine_command(interaction: discord.Interaction):
-    import asyncio
     channel = interaction.channel
     user = interaction.user
     race = None
@@ -330,6 +345,37 @@ async def shrine_command(interaction: discord.Interaction):
     await channel.send(embed=build_shrine_embed(race, before, after, spare + points_before, points_before))
 
 
+# ---------------------------------------------------------------------------
+# /talents — uses talents.json directly via talents.py
+# ---------------------------------------------------------------------------
+
+@tree.command(name="talents", description="Look up Deepwoken talents by name or stat requirement")
+@app_commands.describe(query='Talent name (e.g. "Ghost") or stat requirement (e.g. "40 Agility")')
+async def talents_command(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    stat_query = talent_cache.parse_stat_query(query)
+
+    if stat_query:
+        level, stat = stat_query
+        results = talent_cache.search_by_stat(stat, level)
+        embed = talent_cache.build_stat_results_embed(stat, level, results)
+        await interaction.followup.send(embed=embed)
+    else:
+        talent = talent_cache.search_by_name(query)
+        if not talent:
+            await interaction.followup.send(
+                f"❌ No talent found matching `{query}`. Check your spelling and try again."
+            )
+            return
+        embed = talent_cache.build_talent_embed(talent)
+        await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /races and /help
+# ---------------------------------------------------------------------------
+
 @tree.command(name="races", description="List all races and their stat bonuses")
 async def races_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🧬 Deepwoken Races", color=0x2ECC71)
@@ -342,14 +388,38 @@ async def races_command(interaction: discord.Interaction):
 @tree.command(name="help", description="How to use the Deepwoken shrine bot")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="📖 Shrine Bot — Help", color=0x3498DB)
-    embed.add_field(name="Commands", value="`/shrine` — start the shrine flow\n`/races` — list all races & bonuses\n`/help` — this message", inline=False)
-    embed.add_field(name="How it works", value="1. Pick your race\n2. Enter base stats: `str fort agi int will cha`\n3. Enter attunements (or skip): `flame=80 thunder=35`\n4. Enter weapon (or skip): `med=85`", inline=False)
-    embed.add_field(name="Stat shortcuts", value="`str` `fort` `agi` `int` `will` `cha`\n`flame` `frost` `thunder` `gale` `shadow` `iron` `blood`\n`light` `med` `heavy`", inline=False)
+    embed.add_field(name="Commands", value=(
+        "`/shrine` — start the shrine flow\n"
+        "`/talents` — look up a talent by name or stat\n"
+        "`/races` — list all races & bonuses\n"
+        "`/help` — this message"
+    ), inline=False)
+    embed.add_field(name="How /shrine works", value=(
+        "1. Pick your race\n"
+        "2. Enter base stats: `str fort agi int will cha`\n"
+        "3. Enter attunements (or skip): `flame=80 thunder=35`\n"
+        "4. Enter weapon (or skip): `med=85`"
+    ), inline=False)
+    embed.add_field(name="How /talents works", value=(
+        "Search by name: `/talents Ghost`\n"
+        "Search by stat: `/talents 40 Agility`\n"
+        "Typos are auto-corrected."
+    ), inline=False)
+    embed.add_field(name="Stat shortcuts", value=(
+        "`str` `fort` `agi` `int` `will` `cha`\n"
+        "`flame` `frost` `thunder` `gale` `shadow` `iron` `blood`\n"
+        "`light` `med` `heavy`"
+    ), inline=False)
     embed.set_footer(text="330 total investment points · attunements exempt from −25 cap")
     await interaction.response.send_message(embed=embed)
 
 
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
 _synced = False
+
 
 @bot.event
 async def on_ready():
@@ -357,6 +427,7 @@ async def on_ready():
     if not _synced:
         await tree.sync()
         _synced = True
+        bot.loop.create_task(talent_refresh_loop())
     print(f"✅ Logged in as {bot.user}")
 
 
