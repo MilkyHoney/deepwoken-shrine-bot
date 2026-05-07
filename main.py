@@ -10,6 +10,7 @@ from shrine import (
     ALL_STATS, ATTUNEMENTS, get_racial_bonus, MAX_STAT_INVESTMENT,
 )
 import talents as talent_cache
+import mantras as mantra_cache
 from keep_alive import keep_alive
 
 # ---------------------------------------------------------------------------
@@ -430,6 +431,10 @@ async def talent_refresh_loop():
             talent_cache.refresh_cache()
         except Exception as e:
             print(f"[Talents] Refresh failed: {e}")
+        try:
+            mantra_cache.refresh_cache()
+        except Exception as e:
+            print(f"[Mantras] Refresh failed: {e}")
         await asyncio.sleep(6 * 3600)
 
 
@@ -753,74 +758,12 @@ async def _run_shrine_flow(interaction, user, channel):
 # /talents — with autocomplete, rarity & category filters, exact/gte search
 # ---------------------------------------------------------------------------
 
-async def talent_query_autocomplete(interaction: discord.Interaction, current: str):
-    # Don't autocomplete when the user is typing a stat query like "40 Agility"
-    stripped = (current or "").strip()
-    if re.match(r"^\d+\+?(\s+|$)", stripped):
-        return []
-    names = talent_cache.autocomplete_names(stripped, limit=25)
-    return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names]
+# ---------------------------------------------------------------------------
+# /talents and /mantras live in their own modules
+# ---------------------------------------------------------------------------
 
-
-RARITY_CHOICES = [app_commands.Choice(name=r, value=r) for r in talent_cache.ALL_RARITIES]
-
-
-@tree.command(name="talents", description="Look up Deepwoken talents by name or stat requirement")
-@app_commands.describe(
-    query='Talent name (e.g. "Ghost") or stat requirement ("40 Agility", "40+ Agility")',
-    rarity="Filter by rarity (only applies to stat searches)",
-    category="Filter by category text (e.g. 'Butterfly', 'Tactician') — only for stat searches",
-)
-@app_commands.autocomplete(query=talent_query_autocomplete)
-@app_commands.choices(rarity=RARITY_CHOICES)
-@app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
-async def talents_command(
-    interaction: discord.Interaction,
-    query: str,
-    rarity: app_commands.Choice[str] = None,
-    category: str = None,
-):
-    await interaction.response.defer()
-
-    rarity_str = rarity.value if rarity else None
-
-    stat_query = talent_cache.parse_stat_query(query)
-
-    if stat_query:
-        level, stat, mode = stat_query
-        # If the user explicitly picked rarity:Oath, let oaths through;
-        # otherwise the search excludes them by default.
-        include_oaths = (rarity_str == "Oath")
-        results = talent_cache.search_by_stat(stat, level, mode=mode, include_oaths=include_oaths)
-        if rarity_str or category:
-            results = talent_cache.filter_results(results, rarity=rarity_str, category=category)
-        embeds = talent_cache.build_stat_results_embeds(
-            stat, level, results, mode=mode, rarity=rarity_str, category=category
-        )
-        await interaction.followup.send(embeds=embeds)
-    else:
-        talent, was_fuzzy = talent_cache.search_by_name(query)
-        if not talent:
-            await interaction.followup.send(
-                f"❌ No talent found matching `{query}`. Check your spelling and try again."
-            )
-            return
-        embed = talent_cache.build_talent_embed(talent, did_you_mean=was_fuzzy)
-        await interaction.followup.send(embed=embed)
-
-
-@talents_command.error
-async def talents_on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CommandOnCooldown):
-        try:
-            await interaction.response.send_message(
-                f"⏳ Slow down — try again in {error.retry_after:.1f}s.",
-                ephemeral=True,
-            )
-        except Exception:
-            pass
-    else:
-        print(f"[Talents] Command error: {error}")
+talent_cache.register(tree)
+mantra_cache.register(tree)
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +787,9 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name="Commands", value=(
         "`/shrine` — start the shrine flow\n"
         "`/talents` — look up a talent by name or stat\n"
+        "`/talent_random` — pull a random talent\n"
+        "`/mantras` — look up a mantra by name or attribute\n"
+        "`/mantra_random` — pull a random mantra\n"
         "`/races` — list all races & bonuses\n"
         "`/help` — this message"
     ), inline=False)
