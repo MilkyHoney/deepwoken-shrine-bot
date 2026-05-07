@@ -57,13 +57,11 @@ CANONICAL_STATS = sorted(set(STAT_ALIASES.values()))
 
 
 def normalize_stat(s: str):
-    """Convert any user input ('agi', 'AGILITY', 'agility ') to canonical 'Agility'."""
     if not s:
         return None
     key = s.lower().replace(" ", "")
     if key in STAT_ALIASES:
         return STAT_ALIASES[key]
-    # Fuzzy fallback for typos like "agilit"
     m = fuzz.extractOne(s, CANONICAL_STATS, score_cutoff=60)
     return m[0] if m else None
 
@@ -93,7 +91,6 @@ def get_talents():
 
 
 def refresh_cache():
-    """Reload from disk. Called by main.py's background loop."""
     _cache["talents"] = []
     load_talents()
 
@@ -103,19 +100,43 @@ def refresh_cache():
 # ---------------------------------------------------------------------------
 
 def search_by_name(query: str):
-    """Fuzzy match a talent by name. Returns the talent dict or None."""
+    """
+    Look up a talent by name. Tries:
+      1. Exact case-insensitive match
+      2. Starts-with match (shortest name wins, e.g. 'kick' -> 'Kick Off' not 'Kickstart')
+      3. Substring match (shortest name wins)
+      4. Fuzzy match for typos, with a high cutoff to avoid spurious matches
+         like 'kick off' -> 'Water off a Duck's Back'.
+    Returns the talent dict or None.
+    """
     talents = get_talents()
     if not talents:
         return None
+
+    q = query.strip().lower()
+    if not q:
+        return None
+
+    for t in talents:
+        if t["name"].lower() == q:
+            return t
+
+    starts = [t for t in talents if t["name"].lower().startswith(q)]
+    if starts:
+        return min(starts, key=lambda t: len(t["name"]))
+
+    contains = [t for t in talents if q in t["name"].lower()]
+    if contains:
+        return min(contains, key=lambda t: len(t["name"]))
+
     names = [t["name"] for t in talents]
-    match = fuzz.extractOne(query, names, score_cutoff=50)
+    match = fuzz.extractOne(query, names, score_cutoff=70)
     if not match:
         return None
     return next((t for t in talents if t["name"] == match[0]), None)
 
 
 def search_by_stat(stat: str, level: int):
-    """Find all talents requiring exactly `level` of `stat` (after fuzzy stat normalization)."""
     canonical = normalize_stat(stat)
     if not canonical:
         return []
@@ -132,7 +153,6 @@ def search_by_stat(stat: str, level: int):
 
 
 def parse_stat_query(query: str):
-    """Parse '40 Agility' or 'Agility 40' into (level, stat_name). None if not a stat query."""
     query = query.strip()
     m = re.match(r"^(\d+)\s+(.+)$", query)
     if m:
@@ -148,7 +168,6 @@ def parse_stat_query(query: str):
 # ---------------------------------------------------------------------------
 
 def _format_requirements(reqs: dict) -> str:
-    """Turn the requirements dict into a readable bullet list."""
     if not isinstance(reqs, dict) or not reqs:
         return ""
     lines = []
@@ -202,18 +221,16 @@ def _format_requirements(reqs: dict) -> str:
 
 
 def _format_stat_bonuses(stats) -> str:
-    """Format the bonus stats a talent grants (e.g. {Sanity: 20})."""
     if not isinstance(stats, dict) or not stats:
         return ""
     return ", ".join(f"+{v} {k}" for k, v in stats.items())
 
 
 def build_talent_embed(talent: dict) -> discord.Embed:
-    """Render a single talent into a Discord embed."""
     color = RARITY_COLORS.get(talent.get("rarity", ""), 0x95a5a6)
     title = talent["name"]
     if talent.get("VOI"):
-        title += " 🛡️"  # Vow of Iron marker
+        title += " 🛡️"
     if talent.get("vaulted"):
         title += " (Vaulted)"
 
@@ -249,29 +266,31 @@ def build_talent_embed(talent: dict) -> discord.Embed:
     return embed
 
 
-def build_stat_results_embed(stat: str, level: int, results: list) -> discord.Embed:
-    """Render a list of talents matching a stat search."""
+def build_stat_results_embeds(stat: str, level: int, results: list) -> list:
+    """Render each matching talent as a full embed (Discord allows up to 10 per message)."""
     canonical = normalize_stat(stat) or stat
-    embed = discord.Embed(
-        title=f"Talents requiring exactly {level} {canonical}",
-        color=0x2ecc71,
-    )
+
     if not results:
-        embed.description = f"No talents found requiring **{level} {canonical}**."
-        return embed
+        empty = discord.Embed(
+            title=f"Talents requiring exactly {level} {canonical}",
+            description=f"No talents found requiring **{level} {canonical}**.",
+            color=0x2ecc71,
+        )
+        return [empty]
 
-    lines = []
-    for t in results[:20]:
-        rarity = (t.get("rarity") or "").replace(" Talent", "")
-        category = t.get("category") or ""
-        desc = (t.get("description") or "").strip()
-        snippet = desc[:80] + ("…" if len(desc) > 80 else "")
-        voi = " 🛡️" if t.get("VOI") else ""
-        lines.append(f"**{t['name']}**{voi} _({rarity} · {category})_ — {snippet}")
+    embeds = [build_talent_embed(t) for t in results[:10]]
 
-    embed.description = "\n\n".join(lines)
-    if len(results) > 20:
-        embed.set_footer(text=f"Showing 20 of {len(results)} results")
-    else:
-        embed.set_footer(text=f"{len(results)} talent(s) found")
-    return embed
+    embeds[0].title = (
+        f"{embeds[0].title}  —  {len(results)} match"
+        f"{'es' if len(results) != 1 else ''} for {level} {canonical}"
+    )
+
+    if len(results) > 10:
+        overflow = discord.Embed(
+            title=f"+ {len(results) - 10} more",
+            description="\n".join(f"• {t['name']}" for t in results[10:]),
+            color=0x95a5a6,
+        )
+        embeds.append(overflow)
+
+    return embeds
