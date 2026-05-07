@@ -788,7 +788,10 @@ async def talents_command(
 
     if stat_query:
         level, stat, mode = stat_query
-        results = talent_cache.search_by_stat(stat, level, mode=mode)
+        # If the user explicitly picked rarity:Oath, let oaths through;
+        # otherwise the search excludes them by default.
+        include_oaths = (rarity_str == "Oath")
+        results = talent_cache.search_by_stat(stat, level, mode=mode, include_oaths=include_oaths)
         if rarity_str or category:
             results = talent_cache.filter_results(results, rarity=rarity_str, category=category)
         embeds = talent_cache.build_stat_results_embeds(
