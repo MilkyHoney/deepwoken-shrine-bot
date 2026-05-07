@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 import os
+import re
 import asyncio
 from rapidfuzz import process as fuzz
 
@@ -33,6 +34,9 @@ STAT_ALIASES = {
 VALID_RACES = ", ".join(f"`{r}`" for r in RACIAL_STATS.keys())
 FUZZY_CUTOFF = 55
 
+# Tracks users currently inside a /shrine flow so they can't double-run it
+_active_shrine_users = set()
+
 
 def match_race(text):
     text = text.lower().strip()
@@ -46,15 +50,23 @@ def parse_base_stats(s):
     result = {}
     base_order = ["Strength", "Fortitude", "Agility", "Intelligence", "Willpower", "Charisma"]
     s = s.strip()
+    # Allow "str = 40" and "str=40" both
+    s = re.sub(r"\s*=\s*", "=", s)
     if "=" in s:
         for pair in s.split():
+            if "=" not in pair:
+                raise ValueError(f"Invalid format: `{pair}` — use `stat=value`")
             key, val = pair.split("=", 1)
             key = key.strip().lower()
+            if not key:
+                raise ValueError(f"Invalid format: `{pair}`")
             if key not in STAT_ALIASES:
                 raise ValueError(f"Unknown stat: `{key}`")
             stat = STAT_ALIASES[key]
             if stat not in base_order:
                 raise ValueError(f"`{key}` is not a base stat")
+            if stat in result:
+                raise ValueError(f"Duplicate stat: `{stat}` was set twice")
             v = int(val)
             if v < 0:
                 raise ValueError(f"`{stat}` cannot be negative")
@@ -73,18 +85,24 @@ def parse_base_stats(s):
 
 def parse_kv_stats(s, allowed):
     result = {}
-    if not s.strip():
+    s = s.strip()
+    if not s:
         return result
-    for pair in s.strip().split():
+    s = re.sub(r"\s*=\s*", "=", s)
+    for pair in s.split():
         if "=" not in pair:
             raise ValueError(f"Invalid format: `{pair}` — use `stat=value` (e.g. `flame=80`)")
         key, val = pair.split("=", 1)
         key = key.strip().lower()
+        if not key:
+            raise ValueError(f"Invalid format: `{pair}`")
         if key not in STAT_ALIASES:
             raise ValueError(f"Unknown stat: `{key}`")
         stat = STAT_ALIASES[key]
         if stat not in allowed:
             raise ValueError(f"`{key}` doesn't belong here")
+        if stat in result:
+            raise ValueError(f"Duplicate stat: `{stat}` was set twice")
         v = int(val)
         if v < 0:
             raise ValueError(f"`{stat}` cannot be negative")
@@ -102,6 +120,12 @@ def check_caps(build, race, step="base"):
         if value <= 0:
             continue
         racial = get_racial_bonus(race, stat)
+        # New: a stat can't end up below the racial bonus (you can't un-invest racials)
+        if racial > 0 and value < racial:
+            return (
+                f"❌ **{stat}** can't be below the racial bonus of +{racial}. "
+                f"You entered {value}.\n{retry_hints.get(step, '')}"
+            )
         if value - racial > MAX_STAT_INVESTMENT:
             invested = value - racial
             msg = f"❌ **{stat}** has {invested} points invested, exceeding the 100 point cap"
@@ -176,8 +200,21 @@ class SkipView(discord.ui.View):
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.skipped:
+            try:
+                await interaction.response.defer()
+            except discord.InteractionResponded:
+                pass
+            return
         self.skipped = True
-        await interaction.response.defer()
+        button.disabled = True
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
         self.stop()
 
 
@@ -185,6 +222,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+
+
+async def safe_send(channel, *args, **kwargs):
+    """Send a message, swallowing Forbidden so the flow can abort gracefully."""
+    try:
+        return await channel.send(*args, **kwargs)
+    except discord.Forbidden:
+        print(f"[SafeSend] Forbidden in channel {getattr(channel, 'id', '?')}")
+        return None
 
 
 async def wait_for_message(channel, user, timeout=120):
@@ -198,10 +244,13 @@ async def wait_for_message(channel, user, timeout=120):
 
 
 async def talent_refresh_loop():
-    """Reload talents.json from disk every 6 hours so file edits show up without a restart."""
+    """Reload talents.json every 6 hours. Survives errors so it never silently dies."""
     await bot.wait_until_ready()
     while not bot.is_closed():
-        talent_cache.refresh_cache()
+        try:
+            talent_cache.refresh_cache()
+        except Exception as e:
+            print(f"[Talents] Refresh failed: {e}")
         await asyncio.sleep(6 * 3600)
 
 
@@ -211,63 +260,86 @@ async def talent_refresh_loop():
 
 @tree.command(name="shrine", description="Simulate Shrine of Order on your Deepwoken build")
 async def shrine_command(interaction: discord.Interaction):
-    channel = interaction.channel
     user = interaction.user
+    channel = interaction.channel
+
+    if user.id in _active_shrine_users:
+        try:
+            await interaction.response.send_message(
+                "❌ You already have an active `/shrine` session. Finish it or wait for it to time out.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+        return
+
+    _active_shrine_users.add(user.id)
+    try:
+        await _run_shrine_flow(interaction, user, channel)
+    except discord.Forbidden:
+        # Bot lost permissions mid-flow; nothing else we can do
+        print(f"[Shrine] Forbidden in channel {getattr(channel, 'id', '?')}")
+    finally:
+        _active_shrine_users.discard(user.id)
+
+
+async def _run_shrine_flow(interaction, user, channel):
     race = None
 
     await interaction.response.send_message(embed=races_embed())
     while True:
         race_input = await wait_for_message(channel, user)
         if not race_input:
-            await channel.send("❌ Timed out. Run `/shrine` again.")
+            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
             return
         race = match_race(race_input)
         if not race:
-            await channel.send(f"❌ Unknown race: `{race_input}`. Try again:\nValid races: {VALID_RACES}")
+            await safe_send(channel, f"❌ Unknown race: `{race_input}`. Try again:\nValid races: {VALID_RACES}")
             continue
-        await channel.send(race_confirmed_msg(race))
+        await safe_send(channel, race_confirmed_msg(race))
         break
 
     while True:
         base_input = await wait_for_message(channel, user)
         if not base_input:
-            await channel.send("❌ Timed out. Run `/shrine` again.")
+            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
             return
         if len(base_input.split()) == 1 and not base_input.strip().lstrip('-').isdigit():
             switched = match_race(base_input)
             if switched:
                 race = switched
-                await channel.send(race_confirmed_msg(race))
+                await safe_send(channel, race_confirmed_msg(race))
                 continue
         try:
             build = {stat: 0 for stat in ALL_STATS}
             build.update(parse_base_stats(base_input))
         except ValueError as e:
-            await channel.send(f"❌ {e}\nTry again:")
+            await safe_send(channel, f"❌ {e}\nTry again:")
             continue
         err = check_caps(build, race, step="base")
         if err:
-            await channel.send(err)
+            await safe_send(channel, err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
         racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
-            await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
+            await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
-        await channel.send(f"Base stats set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
+        await safe_send(channel, f"Base stats set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
         break
 
     while True:
         skip_view = SkipView()
-        await channel.send(
+        await safe_send(
+            channel,
             "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
-            view=skip_view
+            view=skip_view,
         )
         msg_task = asyncio.ensure_future(wait_for_message(channel, user))
         done, pending = await asyncio.wait(
             [msg_task, asyncio.ensure_future(skip_view.wait())],
-            return_when=asyncio.FIRST_COMPLETED
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for p in pending:
             p.cancel()
@@ -275,36 +347,37 @@ async def shrine_command(interaction: discord.Interaction):
             break
         att_input = msg_task.result() if msg_task in done and not msg_task.cancelled() else None
         if not att_input:
-            await channel.send("❌ Timed out. Run `/shrine` again.")
+            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
             return
         try:
             build.update(parse_kv_stats(att_input, list(ATTUNEMENTS)))
         except ValueError as e:
-            await channel.send(f"❌ {e}\nTry again:")
+            await safe_send(channel, f"❌ {e}\nTry again:")
             continue
         err = check_caps(build, race, step="attunement")
         if err:
-            await channel.send(err)
+            await safe_send(channel, err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
         racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
-            await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
+            await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
-        await channel.send(f"Attunements set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
+        await safe_send(channel, f"Attunements set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
         break
 
     while True:
         skip_view2 = SkipView()
-        await channel.send(
+        await safe_send(
+            channel,
             "Any **weapon**? e.g. `med=85` or `light=60` or `heavy=70`",
-            view=skip_view2
+            view=skip_view2,
         )
         msg_task = asyncio.ensure_future(wait_for_message(channel, user))
         done, pending = await asyncio.wait(
             [msg_task, asyncio.ensure_future(skip_view2.wait())],
-            return_when=asyncio.FIRST_COMPLETED
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for p in pending:
             p.cancel()
@@ -312,24 +385,24 @@ async def shrine_command(interaction: discord.Interaction):
             break
         wep_input = msg_task.result() if msg_task in done and not msg_task.cancelled() else None
         if not wep_input:
-            await channel.send("❌ Timed out. Run `/shrine` again.")
+            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
             return
         try:
             build.update(parse_kv_stats(wep_input, ["LightWeapon", "MediumWeapon", "HeavyWeapon"]))
         except ValueError as e:
-            await channel.send(f"❌ {e}\nTry again:")
+            await safe_send(channel, f"❌ {e}\nTry again:")
             continue
         err = check_caps(build, race, step="weapon")
         if err:
-            await channel.send(err)
+            await safe_send(channel, err)
             continue
         spent = count_points_spent({k: v for k, v in build.items() if v > 0})
         racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
-            await channel.send(f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
+            await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
-        await channel.send(f"Weapon set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
+        await safe_send(channel, f"Weapon set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
         break
 
     invested = count_points_spent({k: v for k, v in build.items() if v > 0})
@@ -339,14 +412,14 @@ async def shrine_command(interaction: discord.Interaction):
     try:
         after, spare = shrine_of_order(build, race)
     except ValueError as e:
-        await channel.send(f"❌ {e}\nRun `/shrine` again.")
+        await safe_send(channel, f"❌ {e}\nRun `/shrine` again.")
         return
 
-    await channel.send(embed=build_shrine_embed(race, before, after, spare + points_before, points_before))
+    await safe_send(channel, embed=build_shrine_embed(race, before, after, spare + points_before, points_before))
 
 
 # ---------------------------------------------------------------------------
-# /talents — uses talents.json directly via talents.py
+# /talents
 # ---------------------------------------------------------------------------
 
 @tree.command(name="talents", description="Look up Deepwoken talents by name or stat requirement")
@@ -359,8 +432,8 @@ async def talents_command(interaction: discord.Interaction, query: str):
     if stat_query:
         level, stat = stat_query
         results = talent_cache.search_by_stat(stat, level)
-        embed = talent_cache.build_stat_results_embed(stat, level, results)
-        await interaction.followup.send(embed=embed)
+        embeds = talent_cache.build_stat_results_embeds(stat, level, results)
+        await interaction.followup.send(embeds=embeds)
     else:
         talent = talent_cache.search_by_name(query)
         if not talent:
@@ -401,7 +474,7 @@ async def help_command(interaction: discord.Interaction):
         "4. Enter weapon (or skip): `med=85`"
     ), inline=False)
     embed.add_field(name="How /talents works", value=(
-        "Search by name: `/talents Ghost`\n"
+        "Search by name: `/talents Kick Off`\n"
         "Search by stat: `/talents 40 Agility`\n"
         "Typos are auto-corrected."
     ), inline=False)
@@ -431,5 +504,9 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user}")
 
 
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise SystemExit("❌ DISCORD_TOKEN environment variable is not set. Add it in Replit Secrets.")
+
 keep_alive()
-bot.run(os.environ["DISCORD_TOKEN"])
+bot.run(TOKEN)
