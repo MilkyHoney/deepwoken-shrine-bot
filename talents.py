@@ -424,3 +424,111 @@ def build_stat_results_embeds(stat: str, level: int, results: list,
         embeds.append(overflow)
 
     return embeds
+
+
+# ---------------------------------------------------------------------------
+# Slash command registration
+# ---------------------------------------------------------------------------
+
+import random
+from discord import app_commands
+
+
+async def _autocomplete(interaction, current: str):
+    stripped = (current or "").strip()
+    # Don't autocomplete when the user is typing a stat query like "40 Agility"
+    if re.match(r"^\d+\+?(\s+|$)", stripped):
+        return []
+    names = autocomplete_names(stripped, limit=25)
+    return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names]
+
+
+def register(tree: app_commands.CommandTree):
+    """Register /talents and /talent_random commands on the given tree."""
+    rarity_choices = [app_commands.Choice(name=r, value=r) for r in ALL_RARITIES]
+
+    @tree.command(name="talents", description="Look up Deepwoken talents by name or stat requirement")
+    @app_commands.describe(
+        query='Talent name (e.g. "Ghost") or stat requirement ("40 Agility", "40+ Agility")',
+        rarity="Filter by rarity (only applies to stat searches)",
+        category="Filter by category text (e.g. 'Butterfly', 'Tactician') — only for stat searches",
+    )
+    @app_commands.autocomplete(query=_autocomplete)
+    @app_commands.choices(rarity=rarity_choices)
+    @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+    async def talents_command(
+        interaction: discord.Interaction,
+        query: str,
+        rarity: app_commands.Choice[str] = None,
+        category: str = None,
+    ):
+        await interaction.response.defer()
+        rarity_str = rarity.value if rarity else None
+        stat_query = parse_stat_query(query)
+
+        if stat_query:
+            level, stat, mode = stat_query
+            include_oaths = (rarity_str == "Oath")
+            results = search_by_stat(stat, level, mode=mode, include_oaths=include_oaths)
+            if rarity_str or category:
+                results = filter_results(results, rarity=rarity_str, category=category)
+            embeds = build_stat_results_embeds(
+                stat, level, results, mode=mode, rarity=rarity_str, category=category
+            )
+            await interaction.followup.send(embeds=embeds)
+        else:
+            talent, was_fuzzy = search_by_name(query)
+            if not talent:
+                await interaction.followup.send(
+                    f"❌ No talent found matching `{query}`. Check your spelling and try again."
+                )
+                return
+            embed = build_talent_embed(talent, did_you_mean=was_fuzzy)
+            await interaction.followup.send(embed=embed)
+
+    @talents_command.error
+    async def _talents_err(interaction, error):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            try:
+                await interaction.response.send_message(
+                    f"⏳ Slow down — try again in {error.retry_after:.1f}s.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+        else:
+            print(f"[Talents] Command error: {error}")
+
+    @tree.command(name="talent_random", description="Pull a random Deepwoken talent")
+    @app_commands.describe(
+        rarity="Optional: filter by rarity",
+    )
+    @app_commands.choices(rarity=rarity_choices)
+    @app_commands.checks.cooldown(1, 2.0, key=lambda i: i.user.id)
+    async def talent_random_command(
+        interaction: discord.Interaction,
+        rarity: app_commands.Choice[str] = None,
+    ):
+        await interaction.response.defer()
+        pool = get_talents()
+        if rarity:
+            pool = [t for t in pool if (t.get("rarity") or "") == rarity.value]
+        if not pool:
+            await interaction.followup.send("❌ No talents matched that filter.")
+            return
+        pick = random.choice(pool)
+        embed = build_talent_embed(pick)
+        await interaction.followup.send(embed=embed)
+
+    @talent_random_command.error
+    async def _random_err(interaction, error):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            try:
+                await interaction.response.send_message(
+                    f"⏳ Slow down — try again in {error.retry_after:.1f}s.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+        else:
+            print(f"[TalentRandom] Command error: {error}")
