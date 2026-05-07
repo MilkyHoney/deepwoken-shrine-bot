@@ -3,6 +3,7 @@ from discord import app_commands
 import os
 import re
 import asyncio
+import copy
 from rapidfuzz import process as fuzz
 
 from shrine import (
@@ -11,6 +12,13 @@ from shrine import (
 )
 import talents as talent_cache
 from keep_alive import keep_alive
+
+# ---------------------------------------------------------------------------
+# Stat aliases — for /shrine input parsing.
+# These map to shrine.py's no-space form (e.g. "LightWeapon"), which is
+# different from talents.py (which uses "Light Weapon" to match the JSON).
+# This is intentional — the two contexts are isolated.
+# ---------------------------------------------------------------------------
 
 STAT_ALIASES = {
     "str": "Strength", "strength": "Strength",
@@ -34,6 +42,8 @@ STAT_ALIASES = {
 VALID_RACES = ", ".join(f"`{r}`" for r in RACIAL_STATS.keys())
 FUZZY_CUTOFF = 55
 
+CONTROL_HINT = "_Type `cancel`, `restart`, or `back` at any time._"
+
 # Tracks users currently inside a /shrine flow so they can't double-run it
 _active_shrine_users = set()
 
@@ -46,12 +56,21 @@ def match_race(text):
     return m[0] if m else None
 
 
-def parse_base_stats(s):
+def _safe_int(val: str, label: str = "value"):
+    try:
+        return int(val)
+    except ValueError:
+        raise ValueError(f"`{val}` is not a valid number for {label}")
+
+
+def parse_base_stats(s, require_all=False):
+    """
+    Parse '40 50 25 0 40 55' or 'str=40 fort=50 ...'
+    If require_all is True (kv mode), all 6 base stats must be present.
+    """
     result = {}
     base_order = ["Strength", "Fortitude", "Agility", "Intelligence", "Willpower", "Charisma"]
-    s = s.strip()
-    # Allow "str = 40" and "str=40" both
-    s = re.sub(r"\s*=\s*", "=", s)
+    s = re.sub(r"\s*=\s*", "=", s.strip())
     if "=" in s:
         for pair in s.split():
             if "=" not in pair:
@@ -66,17 +85,25 @@ def parse_base_stats(s):
             if stat not in base_order:
                 raise ValueError(f"`{key}` is not a base stat")
             if stat in result:
-                raise ValueError(f"Duplicate stat: `{stat}` was set twice")
-            v = int(val)
+                raise ValueError(f"Duplicate stat: `{stat}` set twice")
+            v = _safe_int(val, stat)
             if v < 0:
                 raise ValueError(f"`{stat}` cannot be negative")
             result[stat] = v
+        if require_all:
+            missing = [s for s in base_order if s not in result]
+            if missing:
+                raise ValueError(
+                    "Missing base stats: " + ", ".join(missing) +
+                    "\nEither include all 6 (e.g. `str=40 fort=50 agi=25 int=0 will=40 cha=55`) "
+                    "or use the space-delimited form: `40 50 25 0 40 55`"
+                )
     else:
         values = s.split()
         if len(values) != 6:
             raise ValueError("Need exactly 6 numbers in order: `str fort agi int will cha`\nExample: `40 50 25 0 40 55`")
         for stat, val in zip(base_order, values):
-            v = int(val)
+            v = _safe_int(val, stat)
             if v < 0:
                 raise ValueError(f"`{stat}` cannot be negative")
             result[stat] = v
@@ -85,10 +112,9 @@ def parse_base_stats(s):
 
 def parse_kv_stats(s, allowed):
     result = {}
-    s = s.strip()
+    s = re.sub(r"\s*=\s*", "=", s.strip())
     if not s:
         return result
-    s = re.sub(r"\s*=\s*", "=", s)
     for pair in s.split():
         if "=" not in pair:
             raise ValueError(f"Invalid format: `{pair}` — use `stat=value` (e.g. `flame=80`)")
@@ -102,8 +128,8 @@ def parse_kv_stats(s, allowed):
         if stat not in allowed:
             raise ValueError(f"`{key}` doesn't belong here")
         if stat in result:
-            raise ValueError(f"Duplicate stat: `{stat}` was set twice")
-        v = int(val)
+            raise ValueError(f"Duplicate stat: `{stat}` set twice")
+        v = _safe_int(val, stat)
         if v < 0:
             raise ValueError(f"`{stat}` cannot be negative")
         result[stat] = v
@@ -120,7 +146,6 @@ def check_caps(build, race, step="base"):
         if value <= 0:
             continue
         racial = get_racial_bonus(race, stat)
-        # New: a stat can't end up below the racial bonus (you can't un-invest racials)
         if racial > 0 and value < racial:
             return (
                 f"❌ **{stat}** can't be below the racial bonus of +{racial}. "
@@ -141,7 +166,7 @@ def races_embed():
     for race, bonuses in RACIAL_STATS.items():
         bonus_str = ", ".join(f"+{v} {k}" for k, v in bonuses.items()) if bonuses else "No bonuses"
         lines.append(f"**{race.capitalize()}** — {bonus_str}")
-    embed.description = "\n".join(lines)
+    embed.description = "\n".join(lines) + f"\n\n{CONTROL_HINT}"
     return embed
 
 
@@ -156,13 +181,46 @@ def race_confirmed_msg(race):
     )
 
 
-def build_shrine_embed(race, before, after, spare, points_before):
+def build_summary_embed(race, build):
+    """A summary embed showing the build before running shrine — for the confirmation step."""
+    invested = count_points_spent({k: v for k, v in build.items() if v > 0})
+    racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
+    spent = invested - racial_total
+
+    racial_bonuses = RACIAL_STATS.get(race, {})
+    racial_str = ", ".join(f"+{v} {k}" for k, v in racial_bonuses.items()) if racial_bonuses else "None"
+
+    embed = discord.Embed(title="📋 Build summary — confirm to run shrine", color=0xF1C40F)
+    embed.add_field(name="Race", value=f"{race.capitalize()} ({racial_str})", inline=False)
+    embed.add_field(name="Points spent", value=f"**{spent} / {TOTAL_POINTS}**", inline=True)
+
+    base_lines, attune_lines, weapon_lines = [], [], []
+    for stat in ALL_STATS:
+        v = build.get(stat, 0)
+        if v == 0:
+            continue
+        if stat in ATTUNEMENTS:
+            attune_lines.append(f"{stat}: **{v}**")
+        elif "Weapon" in stat:
+            weapon_lines.append(f"{stat}: **{v}**")
+        else:
+            base_lines.append(f"{stat}: **{v}**")
+    if base_lines:
+        embed.add_field(name="Base", value="\n".join(base_lines), inline=True)
+    if attune_lines:
+        embed.add_field(name="Attunements", value="\n".join(attune_lines), inline=True)
+    if weapon_lines:
+        embed.add_field(name="Weapons", value="\n".join(weapon_lines), inline=True)
+    return embed
+
+
+def build_shrine_embed(race, before, after, points_after, points_before):
     embed = discord.Embed(title="🏛️ Shrine of Order", color=0x9B59B6)
     racial_bonuses = RACIAL_STATS.get(race, {})
     racial_str = ", ".join(f"+{v} {k}" for k, v in racial_bonuses.items()) if racial_bonuses else "None"
     embed.add_field(name="Race", value=f"{race.capitalize()} ({racial_str})", inline=False)
     embed.add_field(name="Points before shrine", value=str(points_before), inline=True)
-    embed.add_field(name="Points after shrine", value=str(spare), inline=True)
+    embed.add_field(name="Points after shrine", value=str(points_after), inline=True)
     embed.add_field(name="\u200b", value="\u200b", inline=True)
 
     base_lines, attunement_lines, weapon_lines = [], [], []
@@ -193,30 +251,99 @@ def build_shrine_embed(race, before, after, spare, points_before):
     return embed
 
 
-class SkipView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=120)
-        self.skipped = False
+# ---------------------------------------------------------------------------
+# Views
+# ---------------------------------------------------------------------------
 
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.skipped:
+class StepView(discord.ui.View):
+    """Skip + Cancel + Back buttons for in-flow steps."""
+    def __init__(self, allow_skip=False, allow_back=False):
+        super().__init__(timeout=180)
+        self.action = None  # 'skip' | 'cancel' | 'back'
+        self._used = False
+
+        if allow_skip:
+            btn = discord.ui.Button(label="Skip", style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_handler(btn, "skip")
+            self.add_item(btn)
+
+        if allow_back:
+            btn = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary)
+            btn.callback = self._make_handler(btn, "back")
+            self.add_item(btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger)
+        cancel_btn.callback = self._make_handler(cancel_btn, "cancel")
+        self.add_item(cancel_btn)
+
+    def _make_handler(self, button, action):
+        async def handler(interaction: discord.Interaction):
+            if self._used:
+                try:
+                    await interaction.response.defer()
+                except discord.InteractionResponded:
+                    pass
+                return
+            self._used = True
+            self.action = action
+            for c in self.children:
+                c.disabled = True
             try:
-                await interaction.response.defer()
-            except discord.InteractionResponded:
-                pass
-            return
-        self.skipped = True
-        button.disabled = True
-        try:
-            await interaction.response.edit_message(view=self)
-        except Exception:
-            try:
-                await interaction.response.defer()
+                await interaction.response.edit_message(view=self)
             except Exception:
-                pass
-        self.stop()
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+            self.stop()
+        return handler
 
+
+class ConfirmView(discord.ui.View):
+    """Confirm / Restart / Cancel for the final summary step."""
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.action = None
+        self._used = False
+
+        confirm = discord.ui.Button(label="✅ Run Shrine", style=discord.ButtonStyle.success)
+        confirm.callback = self._make_handler(confirm, "confirm")
+        self.add_item(confirm)
+
+        restart = discord.ui.Button(label="🔄 Restart", style=discord.ButtonStyle.primary)
+        restart.callback = self._make_handler(restart, "restart")
+        self.add_item(restart)
+
+        cancel = discord.ui.Button(label="✖ Cancel", style=discord.ButtonStyle.danger)
+        cancel.callback = self._make_handler(cancel, "cancel")
+        self.add_item(cancel)
+
+    def _make_handler(self, button, action):
+        async def handler(interaction: discord.Interaction):
+            if self._used:
+                try:
+                    await interaction.response.defer()
+                except discord.InteractionResponded:
+                    pass
+                return
+            self._used = True
+            self.action = action
+            for c in self.children:
+                c.disabled = True
+            try:
+                await interaction.response.edit_message(view=self)
+            except Exception:
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+            self.stop()
+        return handler
+
+
+# ---------------------------------------------------------------------------
+# Discord setup
+# ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -225,26 +352,79 @@ tree = app_commands.CommandTree(bot)
 
 
 async def safe_send(channel, *args, **kwargs):
-    """Send a message, swallowing Forbidden so the flow can abort gracefully."""
     try:
         return await channel.send(*args, **kwargs)
     except discord.Forbidden:
         print(f"[SafeSend] Forbidden in channel {getattr(channel, 'id', '?')}")
         return None
-
-
-async def wait_for_message(channel, user, timeout=120):
-    def check(m):
-        return m.author == user and m.channel == channel
-    try:
-        msg = await bot.wait_for("message", check=check, timeout=timeout)
-        return msg.content.strip()
-    except asyncio.TimeoutError:
+    except discord.HTTPException as e:
+        print(f"[SafeSend] HTTPException: {e}")
         return None
 
 
+CONTROL_WORDS = {
+    "cancel": "cancel", "stop": "cancel", "quit": "cancel", "exit": "cancel",
+    "restart": "restart", "reset": "restart",
+    "back": "back",
+}
+
+
+async def wait_for_input(channel, user, view=None, timeout=180):
+    """
+    Wait for either a text message from the user OR a button click on `view`.
+    Returns one of:
+        ('text',     content)
+        ('skip',     None)
+        ('cancel',   None)
+        ('restart',  None)
+        ('back',     None)
+        ('timeout',  None)
+    """
+    def check(m):
+        return m.author == user and m.channel == channel
+
+    msg_task = asyncio.ensure_future(bot.wait_for("message", check=check, timeout=timeout))
+    tasks = [msg_task]
+    view_task = None
+    if view is not None:
+        view_task = asyncio.ensure_future(view.wait())
+        tasks.append(view_task)
+
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    except Exception as e:
+        print(f"[wait_for_input] error: {e}")
+        for t in tasks:
+            t.cancel()
+        return ("timeout", None)
+
+    for p in pending:
+        p.cancel()
+
+    if view_task in done and view is not None and view.action is not None:
+        return (view.action, None)
+
+    if msg_task in done and not msg_task.cancelled():
+        try:
+            msg = msg_task.result()
+        except asyncio.TimeoutError:
+            return ("timeout", None)
+        except Exception:
+            return ("timeout", None)
+        content = msg.content.strip()
+        low = content.lower()
+        if low in CONTROL_WORDS:
+            return (CONTROL_WORDS[low], None)
+        return ("text", content)
+
+    return ("timeout", None)
+
+
+# ---------------------------------------------------------------------------
+# Talent refresh background task
+# ---------------------------------------------------------------------------
+
 async def talent_refresh_loop():
-    """Reload talents.json every 6 hours. Survives errors so it never silently dies."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
@@ -255,10 +435,11 @@ async def talent_refresh_loop():
 
 
 # ---------------------------------------------------------------------------
-# /shrine
+# /shrine — state-machine flow with cancel/restart/back support
 # ---------------------------------------------------------------------------
 
 @tree.command(name="shrine", description="Simulate Shrine of Order on your Deepwoken build")
+@app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
 async def shrine_command(interaction: discord.Interaction):
     user = interaction.user
     channel = interaction.channel
@@ -277,172 +458,363 @@ async def shrine_command(interaction: discord.Interaction):
     try:
         await _run_shrine_flow(interaction, user, channel)
     except discord.Forbidden:
-        # Bot lost permissions mid-flow; nothing else we can do
         print(f"[Shrine] Forbidden in channel {getattr(channel, 'id', '?')}")
+    except discord.HTTPException as e:
+        print(f"[Shrine] HTTPException: {e}")
+        await safe_send(channel, "❌ Discord rejected a message. Run `/shrine` again.")
+    except Exception as e:
+        print(f"[Shrine] Unexpected error: {type(e).__name__}: {e}")
+        await safe_send(channel, "❌ Something went wrong. Run `/shrine` again.")
     finally:
         _active_shrine_users.discard(user.id)
 
 
-async def _run_shrine_flow(interaction, user, channel):
-    race = None
+@shrine_command.error
+async def shrine_on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        try:
+            await interaction.response.send_message(
+                f"⏳ Slow down — try again in {error.retry_after:.1f}s.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+    else:
+        print(f"[Shrine] Command error: {error}")
 
-    await interaction.response.send_message(embed=races_embed())
+
+async def _step_base(channel, user, race, build):
     while True:
-        race_input = await wait_for_message(channel, user)
-        if not race_input:
-            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
-            return
-        race = match_race(race_input)
-        if not race:
-            await safe_send(channel, f"❌ Unknown race: `{race_input}`. Try again:\nValid races: {VALID_RACES}")
+        view = StepView(allow_back=True)
+        await safe_send(channel, "Enter your **base stats** in order: `str fort agi int will cha`", view=view)
+        action, content = await wait_for_input(channel, user, view=view)
+        if action in ("timeout", "cancel", "restart", "back"):
+            return (action, race, build)
+        if action != "text":
             continue
-        await safe_send(channel, race_confirmed_msg(race))
-        break
 
-    while True:
-        base_input = await wait_for_message(channel, user)
-        if not base_input:
-            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
-            return
-        if len(base_input.split()) == 1 and not base_input.strip().lstrip('-').isdigit():
-            switched = match_race(base_input)
+        # Single-word non-digit on the base step is treated as a race switch
+        if len(content.split()) == 1 and not content.lstrip('-').isdigit():
+            switched = match_race(content)
             if switched:
                 race = switched
                 await safe_send(channel, race_confirmed_msg(race))
                 continue
+
         try:
-            build = {stat: 0 for stat in ALL_STATS}
-            build.update(parse_base_stats(base_input))
+            new_build = {stat: 0 for stat in ALL_STATS}
+            new_build.update(parse_base_stats(content, require_all=True))
         except ValueError as e:
             await safe_send(channel, f"❌ {e}\nTry again:")
             continue
-        err = check_caps(build, race, step="base")
+        err = check_caps(new_build, race, step="base")
         if err:
             await safe_send(channel, err)
             continue
-        spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
+        spent = count_points_spent({k: v for k, v in new_build.items() if v > 0})
+        racial_total = sum(get_racial_bonus(race, s) for s, v in new_build.items() if v > 0)
         invested = spent - racial_total
         if invested > TOTAL_POINTS:
             await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
             continue
         await safe_send(channel, f"Base stats set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
-        break
+        return ("continue", race, new_build)
 
+
+async def _step_kv(channel, user, race, build, allowed_stats, prompt_text, step_name):
     while True:
-        skip_view = SkipView()
+        view = StepView(allow_skip=True, allow_back=True)
+        await safe_send(channel, prompt_text, view=view)
+        action, content = await wait_for_input(channel, user, view=view)
+        if action in ("timeout", "cancel", "restart", "back"):
+            return (action, build)
+        if action == "skip":
+            return ("continue", build)
+        if action != "text":
+            continue
+
+        # Work on a copy so a bad input doesn't corrupt earlier state
+        new_build = dict(build)
+        try:
+            new_build.update(parse_kv_stats(content, allowed_stats))
+        except ValueError as e:
+            await safe_send(channel, f"❌ {e}\nTry again:")
+            continue
+        err = check_caps(new_build, race, step=step_name)
+        if err:
+            await safe_send(channel, err)
+            continue
+        spent = count_points_spent({k: v for k, v in new_build.items() if v > 0})
+        racial_total = sum(get_racial_bonus(race, s) for s, v in new_build.items() if v > 0)
+        invested = spent - racial_total
+        if invested > TOTAL_POINTS:
+            await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
+            continue
         await safe_send(
             channel,
+            f"{step_name.capitalize()} set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left"
+        )
+        return ("continue", new_build)
+
+
+async def _step_confirm(channel, user, race, build):
+    while True:
+        view = ConfirmView()
+        await safe_send(channel, embed=build_summary_embed(race, build), view=view)
+        action, _ = await wait_for_input(channel, user, view=view)
+        if action == "timeout":
+            return "timeout"
+        if action in ("confirm", "restart", "cancel", "back"):
+            return action
+
+
+async def _run_shrine_flow(interaction, user, channel):
+    # Send the initial race prompt
+    await interaction.response.send_message(embed=races_embed())
+
+    while True:  # restart loop
+        race = None
+        build = {stat: 0 for stat in ALL_STATS}
+        snapshots = []  # (race, build) saved before each step
+
+        # Step 1: race
+        view = StepView(allow_back=False)
+        prompt = await safe_send(channel, "_(Type a race name, or use the buttons.)_", view=view)
+        while race is None:
+            action, content = await wait_for_input(channel, user, view=view)
+            if action == "timeout":
+                await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                return
+            if action == "cancel":
+                await safe_send(channel, "✖ Cancelled.")
+                return
+            if action == "back":
+                await safe_send(channel, "_(You're on the first step — nothing to go back to.)_")
+                view = StepView(allow_back=False)
+                await safe_send(channel, "_(Type a race name, or use the buttons.)_", view=view)
+                continue
+            if action == "restart":
+                break
+            if action == "text":
+                matched = match_race(content)
+                if not matched:
+                    await safe_send(channel, f"❌ Unknown race: `{content}`. Try again:\nValid races: {VALID_RACES}")
+                    view = StepView(allow_back=False)
+                    await safe_send(channel, "_(Type a race name, or use the buttons.)_", view=view)
+                    continue
+                race = matched
+                await safe_send(channel, race_confirmed_msg(race))
+                break
+            view = StepView(allow_back=False)
+            await safe_send(channel, "_(Type a race name, or use the buttons.)_", view=view)
+
+        if race is None:
+            continue  # restart
+
+        # Step 2: base stats
+        snapshots.append((race, copy.deepcopy(build)))
+        action, race, build = await _step_base(channel, user, race, build)
+        if action == "timeout":
+            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+            return
+        if action == "cancel":
+            await safe_send(channel, "✖ Cancelled.")
+            return
+        if action == "restart":
+            continue
+        if action == "back":
+            continue  # restart (only step before this is race)
+
+        # Step 3: attunements
+        snapshots.append((race, copy.deepcopy(build)))
+        action, build = await _step_kv(
+            channel, user, race, build, list(ATTUNEMENTS),
             "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
-            view=skip_view,
+            "attunement",
         )
-        msg_task = asyncio.ensure_future(wait_for_message(channel, user))
-        done, pending = await asyncio.wait(
-            [msg_task, asyncio.ensure_future(skip_view.wait())],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for p in pending:
-            p.cancel()
-        if skip_view.skipped:
-            break
-        att_input = msg_task.result() if msg_task in done and not msg_task.cancelled() else None
-        if not att_input:
+        if action == "timeout":
             await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
             return
-        try:
-            build.update(parse_kv_stats(att_input, list(ATTUNEMENTS)))
-        except ValueError as e:
-            await safe_send(channel, f"❌ {e}\nTry again:")
+        if action == "cancel":
+            await safe_send(channel, "✖ Cancelled.")
+            return
+        if action == "restart":
             continue
-        err = check_caps(build, race, step="attunement")
-        if err:
-            await safe_send(channel, err)
-            continue
-        spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
-        invested = spent - racial_total
-        if invested > TOTAL_POINTS:
-            await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
-            continue
-        await safe_send(channel, f"Attunements set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
-        break
+        if action == "back":
+            race, build = snapshots[-1]
+            snapshots = snapshots[:-1]
+            # Re-run base step
+            action, race, build = await _step_base(channel, user, race, build)
+            if action == "cancel":
+                await safe_send(channel, "✖ Cancelled.")
+                return
+            if action == "restart" or action == "back" or action == "timeout":
+                if action == "timeout":
+                    await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                    return
+                continue
+            # Then re-run attunements once
+            snapshots.append((race, copy.deepcopy(build)))
+            action, build = await _step_kv(
+                channel, user, race, build, list(ATTUNEMENTS),
+                "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
+                "attunement",
+            )
+            if action in ("cancel", "restart", "back", "timeout"):
+                if action == "timeout":
+                    await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                    return
+                if action == "cancel":
+                    await safe_send(channel, "✖ Cancelled.")
+                    return
+                continue
 
-    while True:
-        skip_view2 = SkipView()
-        await safe_send(
-            channel,
+        # Step 4: weapon
+        snapshots.append((race, copy.deepcopy(build)))
+        action, build = await _step_kv(
+            channel, user, race, build, ["LightWeapon", "MediumWeapon", "HeavyWeapon"],
             "Any **weapon**? e.g. `med=85` or `light=60` or `heavy=70`",
-            view=skip_view2,
+            "weapon",
         )
-        msg_task = asyncio.ensure_future(wait_for_message(channel, user))
-        done, pending = await asyncio.wait(
-            [msg_task, asyncio.ensure_future(skip_view2.wait())],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for p in pending:
-            p.cancel()
-        if skip_view2.skipped:
-            break
-        wep_input = msg_task.result() if msg_task in done and not msg_task.cancelled() else None
-        if not wep_input:
+        if action == "timeout":
             await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
             return
-        try:
-            build.update(parse_kv_stats(wep_input, ["LightWeapon", "MediumWeapon", "HeavyWeapon"]))
-        except ValueError as e:
-            await safe_send(channel, f"❌ {e}\nTry again:")
+        if action == "cancel":
+            await safe_send(channel, "✖ Cancelled.")
+            return
+        if action == "restart":
             continue
-        err = check_caps(build, race, step="weapon")
-        if err:
-            await safe_send(channel, err)
-            continue
-        spent = count_points_spent({k: v for k, v in build.items() if v > 0})
-        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
-        invested = spent - racial_total
-        if invested > TOTAL_POINTS:
-            await safe_send(channel, f"❌ That's **{invested}** points invested, exceeding the {TOTAL_POINTS} budget. Try again:")
-            continue
-        await safe_send(channel, f"Weapon set — **{invested}/{TOTAL_POINTS}** points spent, **{TOTAL_POINTS - invested}** left")
-        break
+        if action == "back":
+            race, build = snapshots[-1]
+            snapshots = snapshots[:-1]
+            # Re-run attunements step
+            action, build = await _step_kv(
+                channel, user, race, build, list(ATTUNEMENTS),
+                "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
+                "attunement",
+            )
+            if action in ("cancel", "restart", "timeout", "back"):
+                if action == "timeout":
+                    await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                    return
+                if action == "cancel":
+                    await safe_send(channel, "✖ Cancelled.")
+                    return
+                continue
+            # Re-run weapon
+            snapshots.append((race, copy.deepcopy(build)))
+            action, build = await _step_kv(
+                channel, user, race, build, ["LightWeapon", "MediumWeapon", "HeavyWeapon"],
+                "Any **weapon**? e.g. `med=85` or `light=60` or `heavy=70`",
+                "weapon",
+            )
+            if action in ("cancel", "restart", "back", "timeout"):
+                if action == "timeout":
+                    await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                    return
+                if action == "cancel":
+                    await safe_send(channel, "✖ Cancelled.")
+                    return
+                continue
 
-    invested = count_points_spent({k: v for k, v in build.items() if v > 0})
-    racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
-    points_before = TOTAL_POINTS - (invested - racial_total)
-    before = build.copy()
-    try:
-        after, spare = shrine_of_order(build, race)
-    except ValueError as e:
-        await safe_send(channel, f"❌ {e}\nRun `/shrine` again.")
+        # Step 5: confirm
+        confirm_action = await _step_confirm(channel, user, race, build)
+        if confirm_action == "timeout":
+            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+            return
+        if confirm_action == "cancel":
+            await safe_send(channel, "✖ Cancelled.")
+            return
+        if confirm_action == "restart":
+            continue
+        if confirm_action == "back":
+            # Treat back from confirm as restart
+            continue
+
+        # Run shrine
+        invested = count_points_spent({k: v for k, v in build.items() if v > 0})
+        racial_total = sum(get_racial_bonus(race, s) for s, v in build.items() if v > 0)
+        points_before = TOTAL_POINTS - (invested - racial_total)
+        before = build.copy()
+        try:
+            after, spare = shrine_of_order(build, race)
+        except ValueError as e:
+            await safe_send(channel, f"❌ {e}\nRun `/shrine` again.")
+            return
+
+        await safe_send(channel, embed=build_shrine_embed(race, before, after, spare + points_before, points_before))
         return
 
-    await safe_send(channel, embed=build_shrine_embed(race, before, after, spare + points_before, points_before))
-
 
 # ---------------------------------------------------------------------------
-# /talents
+# /talents — with autocomplete, rarity & category filters, exact/gte search
 # ---------------------------------------------------------------------------
+
+async def talent_query_autocomplete(interaction: discord.Interaction, current: str):
+    # Don't autocomplete when the user is typing a stat query like "40 Agility"
+    stripped = (current or "").strip()
+    if re.match(r"^\d+\+?(\s+|$)", stripped):
+        return []
+    names = talent_cache.autocomplete_names(stripped, limit=25)
+    return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names]
+
+
+RARITY_CHOICES = [app_commands.Choice(name=r, value=r) for r in talent_cache.ALL_RARITIES]
+
 
 @tree.command(name="talents", description="Look up Deepwoken talents by name or stat requirement")
-@app_commands.describe(query='Talent name (e.g. "Ghost") or stat requirement (e.g. "40 Agility")')
-async def talents_command(interaction: discord.Interaction, query: str):
+@app_commands.describe(
+    query='Talent name (e.g. "Ghost") or stat requirement ("40 Agility", "40+ Agility")',
+    rarity="Filter by rarity (only applies to stat searches)",
+    category="Filter by category text (e.g. 'Butterfly', 'Tactician') — only for stat searches",
+)
+@app_commands.autocomplete(query=talent_query_autocomplete)
+@app_commands.choices(rarity=RARITY_CHOICES)
+@app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+async def talents_command(
+    interaction: discord.Interaction,
+    query: str,
+    rarity: app_commands.Choice[str] = None,
+    category: str = None,
+):
     await interaction.response.defer()
+
+    rarity_str = rarity.value if rarity else None
 
     stat_query = talent_cache.parse_stat_query(query)
 
     if stat_query:
-        level, stat = stat_query
-        results = talent_cache.search_by_stat(stat, level)
-        embeds = talent_cache.build_stat_results_embeds(stat, level, results)
+        level, stat, mode = stat_query
+        results = talent_cache.search_by_stat(stat, level, mode=mode)
+        if rarity_str or category:
+            results = talent_cache.filter_results(results, rarity=rarity_str, category=category)
+        embeds = talent_cache.build_stat_results_embeds(
+            stat, level, results, mode=mode, rarity=rarity_str, category=category
+        )
         await interaction.followup.send(embeds=embeds)
     else:
-        talent = talent_cache.search_by_name(query)
+        talent, was_fuzzy = talent_cache.search_by_name(query)
         if not talent:
             await interaction.followup.send(
                 f"❌ No talent found matching `{query}`. Check your spelling and try again."
             )
             return
-        embed = talent_cache.build_talent_embed(talent)
+        embed = talent_cache.build_talent_embed(talent, did_you_mean=was_fuzzy)
         await interaction.followup.send(embed=embed)
+
+
+@talents_command.error
+async def talents_on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        try:
+            await interaction.response.send_message(
+                f"⏳ Slow down — try again in {error.retry_after:.1f}s.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+    else:
+        print(f"[Talents] Command error: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +824,11 @@ async def talents_command(interaction: discord.Interaction, query: str):
 @tree.command(name="races", description="List all races and their stat bonuses")
 async def races_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🧬 Deepwoken Races", color=0x2ECC71)
+    lines = []
     for race, bonuses in RACIAL_STATS.items():
         bonus_str = ", ".join(f"+{v} {k}" for k, v in bonuses.items()) if bonuses else "No bonuses"
-        embed.add_field(name=race.capitalize(), value=bonus_str, inline=True)
+        lines.append(f"**{race.capitalize()}** — {bonus_str}")
+    embed.description = "\n".join(lines)
     await interaction.response.send_message(embed=embed)
 
 
@@ -467,16 +841,22 @@ async def help_command(interaction: discord.Interaction):
         "`/races` — list all races & bonuses\n"
         "`/help` — this message"
     ), inline=False)
+    embed.add_field(name="During /shrine", value=(
+        "Type `cancel`, `restart`, or `back` at any time, or use the buttons."
+    ), inline=False)
     embed.add_field(name="How /shrine works", value=(
         "1. Pick your race\n"
         "2. Enter base stats: `str fort agi int will cha`\n"
         "3. Enter attunements (or skip): `flame=80 thunder=35`\n"
-        "4. Enter weapon (or skip): `med=85`"
+        "4. Enter weapon (or skip): `med=85`\n"
+        "5. Confirm to run shrine"
     ), inline=False)
     embed.add_field(name="How /talents works", value=(
-        "Search by name: `/talents Kick Off`\n"
-        "Search by stat: `/talents 40 Agility`\n"
-        "Typos are auto-corrected."
+        "Search by name: `/talents Kick Off` (autocomplete enabled)\n"
+        "Stat exact: `/talents 40 Agility`\n"
+        "Stat or higher: `/talents 40+ Agility`\n"
+        "Filter by rarity: pick the optional `rarity` field\n"
+        "Filter by category: type into the optional `category` field"
     ), inline=False)
     embed.add_field(name="Stat shortcuts", value=(
         "`str` `fort` `agi` `int` `will` `cha`\n"
