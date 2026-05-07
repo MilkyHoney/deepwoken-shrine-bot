@@ -202,13 +202,8 @@ def search_by_stat(stat: str, level: int, mode: str = "exact",
         elif mode == "exact" and v == level:
             results.append(t)
 
-    # Sort by rarity priority (Advanced → Rare → Common → others), then stat, then name
-    def _sort_key(t):
-        rarity_rank = RARITY_SORT_ORDER.get(t.get("rarity") or "", 50)
-        stat_val = (t.get("requirements") or {}).get("stats", {}).get(canonical, 0)
-        return (rarity_rank, stat_val, t["name"])
-
-    results.sort(key=_sort_key)
+    # Sort alphabetically by name
+    results.sort(key=lambda t: t["name"].lower())
     return results
 
 
@@ -413,13 +408,14 @@ def build_stat_results_embeds(stat: str, level: int, results: list,
     )
 
     if has_overflow:
-        remaining = results[9:]
-        # Cap description to stay under Discord's 4096-char limit
+        remaining = sorted(results[9:], key=lambda t: t["name"].lower())
+        # Cap description to stay under Discord's 4096-char limit.
+        # Use newlines between names so each one renders on its own line.
         lines = [f"• {t['name']}" for t in remaining]
-        shown_lines = lines[:30]
+        shown_lines = lines[:40]
         desc = "\n".join(shown_lines)
-        if len(lines) > 30:
-            desc += f"\n…and {len(lines) - 30} more"
+        if len(lines) > 40:
+            desc += f"\n…and {len(lines) - 40} more"
         overflow = discord.Embed(
             title=f"+ {len(remaining)} more",
             description=desc,
