@@ -3,7 +3,6 @@ from discord import app_commands
 import os
 import re
 import asyncio
-import copy
 from rapidfuzz import process as fuzz
 
 from shrine import (
@@ -612,7 +611,7 @@ async def _run_shrine_flow(interaction, user, channel):
             continue  # restart
 
         # Step 2: base stats
-        snapshots.append((race, copy.deepcopy(build)))
+        snapshots.append((race, build.copy()))
         action, race, build = await _step_base(channel, user, race, build)
         if action == "timeout":
             await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
@@ -626,7 +625,7 @@ async def _run_shrine_flow(interaction, user, channel):
             continue  # restart (only step before this is race)
 
         # Step 3: attunements
-        snapshots.append((race, copy.deepcopy(build)))
+        snapshots.append((race, build.copy()))
         action, build = await _step_kv(
             channel, user, race, build, list(ATTUNEMENTS),
             "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
@@ -654,7 +653,7 @@ async def _run_shrine_flow(interaction, user, channel):
                     return
                 continue
             # Then re-run attunements once
-            snapshots.append((race, copy.deepcopy(build)))
+            snapshots.append((race, build.copy()))
             action, build = await _step_kv(
                 channel, user, race, build, list(ATTUNEMENTS),
                 "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
@@ -669,66 +668,70 @@ async def _run_shrine_flow(interaction, user, channel):
                     return
                 continue
 
-        # Step 4: weapon
-        snapshots.append((race, copy.deepcopy(build)))
-        action, build = await _step_kv(
-            channel, user, race, build, ["LightWeapon", "MediumWeapon", "HeavyWeapon"],
-            "Any **weapon**? e.g. `med=85` or `light=60` or `heavy=70`",
-            "weapon",
-        )
-        if action == "timeout":
-            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
-            return
-        if action == "cancel":
-            await safe_send(channel, "✖ Cancelled.")
-            return
-        if action == "restart":
-            continue
-        if action == "back":
-            race, build = snapshots[-1]
-            snapshots = snapshots[:-1]
-            # Re-run attunements step
-            action, build = await _step_kv(
-                channel, user, race, build, list(ATTUNEMENTS),
-                "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
-                "attunement",
-            )
-            if action in ("cancel", "restart", "timeout", "back"):
-                if action == "timeout":
-                    await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
-                    return
-                if action == "cancel":
-                    await safe_send(channel, "✖ Cancelled.")
-                    return
-                continue
-            # Re-run weapon
-            snapshots.append((race, copy.deepcopy(build)))
+        # Steps 4 & 5: weapon + confirm in an inner loop so "back" from
+        # confirm reruns just the weapon step.
+        weapon_snapshot_pushed = False
+        while True:
+            # Step 4: weapon
+            if not weapon_snapshot_pushed:
+                snapshots.append((race, build.copy()))
+                weapon_snapshot_pushed = True
             action, build = await _step_kv(
                 channel, user, race, build, ["LightWeapon", "MediumWeapon", "HeavyWeapon"],
                 "Any **weapon**? e.g. `med=85` or `light=60` or `heavy=70`",
                 "weapon",
             )
-            if action in ("cancel", "restart", "back", "timeout"):
-                if action == "timeout":
-                    await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
-                    return
-                if action == "cancel":
-                    await safe_send(channel, "✖ Cancelled.")
-                    return
+            if action == "timeout":
+                await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                return
+            if action == "cancel":
+                await safe_send(channel, "✖ Cancelled.")
+                return
+            if action == "restart":
+                break  # break inner, outer 'continue' below
+            if action == "back":
+                race, build = snapshots[-1]
+                snapshots = snapshots[:-1]
+                # Re-run attunements step
+                action, build = await _step_kv(
+                    channel, user, race, build, list(ATTUNEMENTS),
+                    "Any **attunements**? Enter all separated by spaces:\n`flame=80 thunder=35 frost=40`",
+                    "attunement",
+                )
+                if action in ("cancel", "restart", "timeout", "back"):
+                    if action == "timeout":
+                        await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                        return
+                    if action == "cancel":
+                        await safe_send(channel, "✖ Cancelled.")
+                        return
+                    break  # break inner, outer continue
+                # Loop and rerun weapon step
+                weapon_snapshot_pushed = False
                 continue
 
-        # Step 5: confirm
-        confirm_action = await _step_confirm(channel, user, race, build)
-        if confirm_action == "timeout":
-            await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
-            return
-        if confirm_action == "cancel":
-            await safe_send(channel, "✖ Cancelled.")
-            return
-        if confirm_action == "restart":
-            continue
-        if confirm_action == "back":
-            # Treat back from confirm as restart
+            # Step 5: confirm
+            confirm_action = await _step_confirm(channel, user, race, build)
+            if confirm_action == "timeout":
+                await safe_send(channel, "❌ Timed out. Run `/shrine` again.")
+                return
+            if confirm_action == "cancel":
+                await safe_send(channel, "✖ Cancelled.")
+                return
+            if confirm_action == "restart":
+                break  # break inner, outer continue
+            if confirm_action == "back":
+                # Pop weapon snapshot and rerun weapon step
+                race, build = snapshots[-1]
+                snapshots = snapshots[:-1]
+                weapon_snapshot_pushed = False
+                continue
+            # confirmed
+            break
+
+        # If we broke out due to restart/timeout/cancel, the action vars
+        # already returned. We only fall through here on confirm.
+        if action == "restart" or confirm_action == "restart":
             continue
 
         # Run shrine
