@@ -8,3 +8,4 @@ plan on making an automated builder soon
 | `/help`            | Show help                                        |
 
 ^ lazy to change, just use /help lol
+i rarely update my github
