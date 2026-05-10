@@ -117,9 +117,11 @@ def shrine_of_order(stats: dict, race: str) -> tuple[dict, int]:
 
         previous = stats.copy()
 
-    # Floor all stats
+    # Floor all stats with epsilon to fix float precision
+    # (e.g. 25.9999999996 should be 26, but 48.571 should be 48)
+    import math
     for stat in affected_stats:
-        stats[stat] = int(stats[stat])
+        stats[stat] = math.floor(stats[stat] + 1e-9)
 
     # Calculate spare points after flooring
     points_after = count_points_spent(stats)
